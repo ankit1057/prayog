@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.6.0 — 2026-11-13
+
+**Runtime pivot: sipllm → llama.cpp.**
+
+Prayog 0.1–0.5 drove sipllm's `llm-engine`. Sipllm is retired as a runtime
+for this repo; `llama.cpp`'s `llama-cli` is the new backend. Reasons:
+stability (industry-standard, broadly tested), aarch64 NEON that we don't
+have to maintain, `llama-bench` as a known-good peer benchmark we can
+cross-check against. If a second runtime ever lands (ollama, ExecuTorch),
+it should be a `--engine` selector, not a replacement.
+
+### engine
+- Default engine path is now `~/llama.cpp/build/bin/llama-cli` (overridable
+  via `--engine` on any subcommand).
+- `parse_inference_metrics` now understands two output formats:
+    - **Format 1 — classic `llama_perf_context_print` on stderr** (emitted
+      by `llama-simple` and older `llama-cli` builds). Parses prefill /
+      decode tok/s, prompt/gen token counts, TTFT, and `n_ctx`.
+    - **Format 2 — chat-mode one-liner on stdout** (emitted by newer
+      `llama-cli` builds like b1-5676dfb, which no longer print the
+      perf_context block even with `--perf`). Parses
+      `[ Prompt: X t/s | Generation: Y t/s ]` for prefill / decode tok/s.
+      Token counts, TTFT, and `n_ctx` are not available in this format
+      and come through as 0.
+  Format 1 takes precedence when both are present.
+- argv composition (sweep / agree / agree-batch) switched from positional
+  `<model>` + `--greedy --threads` to llama-cli's flags: `-m MODEL`,
+  `--temp 0.0`, `-t N`, `-s SEED`, `-st --simple-io --no-display-prompt`.
+  `-no-cnv` does not exist in current llama.cpp; `-st` (single-turn) plus
+  `--simple-io` gives equivalent "one prompt, one response, exit" behavior.
+- `cmd_run` inference auto-detect now matches `llama-cli` / `llama-bench`
+  in the cmd path.
+- **TOML args parser bugfix.** `load_experiment` now unescapes `\"` and
+  `\\` (TOML basic-string escapes) after stripping the outer quotes.
+  Previously, an `args = "... -p \"prompt\" ..."` line produced a literal
+  backslash in a non-quoted context; the subsequent split_args() saw an
+  unescaped `"` and swallowed the rest of the line into a single argument,
+  silently dropping every flag after the prompt.
+
+### experiments
+- `001-sipllm-coldstart.toml` renamed experiment to `llama-cli-coldstart`
+  (filename kept for git-history continuity).
+- `003-tinyllama-greedy-16.toml` updated to invoke `llama-cli` with the
+  correct flag names; still TinyLlama 1.1B Q8_0 greedy 16 tokens.
+
+### runtime fields temporarily missing
+- `weights_resident_mb`, `streamed_mb`, `kv_cache_mb` were populated by
+  sipllm's custom summary block. llama.cpp doesn't print them in the same
+  line-oriented form; the JSON fields remain in the schema but hold `0`
+  until a dedicated model-loader-line parser is added. `prayog.run/2`
+  schema is unchanged — no Android changes needed.
+- Under chat-mode llama-cli (Format 2), `ttft_s`, `prompt_tokens`,
+  `generated`, and `context_max` also come through as 0. Switch to
+  `llama-simple` or an older llama-cli if these are needed.
+
+### build pre-req
+Prayog now requires llama.cpp built locally. Termux NDK has a libc++
+`__hash_memory` symbol mismatch that fails llama.cpp's default shared-lib
+link; workaround is `-DBUILD_SHARED_LIBS=OFF` (see README quickstart).
+
 ## 0.5.0 — 2026-11-13
 
 **Batch agreement over a prompt corpus.**

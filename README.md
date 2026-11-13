@@ -10,17 +10,29 @@ Android phone, **first-class**. Two surfaces:
   shared storage and shows them.
 
 No PyTorch, no ONNX, no ggml, no BLAS, no Python. The engine wraps whatever
-inference binary you want to study (first target: [`sipllm`](https://github.com/ankit1057/sipllm)'s
-`llm-engine`) and emits structured JSON reports that the app visualises.
+inference binary you want to study (first target: [`llama.cpp`](https://github.com/ggml-org/llama.cpp)'s
+`llama-cli`) and emits structured JSON reports that the app visualises.
 
 ## end-to-end quickstart (Termux side)
 
 ```bash
+# one-time: build llama.cpp (the runtime prayog drives).
+# BUILD_SHARED_LIBS=OFF avoids a Termux NDK libc++ symbol mismatch
+# (__hash_memory) that fails the shared-lib link.
+cd ~
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON \
+               -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF
+cmake --build build --target llama-cli llama-bench -j$(nproc)
+
+# build prayog
 cd ~/prayog/engine
 make
-./build/prayog run ../experiments/001-sipllm-coldstart.toml
-./build/prayog run ../experiments/002-sh-coldstart.toml
-./build/prayog compare reports/*-sipllm-coldstart.json reports/*-sh-coldstart.json
+./build/prayog pull tinyllama:q8_0
+./build/prayog bench --inference ~/llama.cpp/build/bin/llama-cli \
+    -m ~/prayog/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+    -p "The capital of France is" -n 16 --temp 0.0 -t 4 -no-cnv
 ```
 
 Reports land in `$PRAYOG_HOME/reports` (default `~/prayog/reports`).

@@ -1,13 +1,15 @@
-# 003 — TinyLlama 1.1B Q8_0, greedy decode, 16 tokens.
+# 003 — TinyLlama 1.1B Q8_0, greedy decode, 16 tokens via llama-cli.
 #
-# What: first real inference benchmark. One prompt, greedy sampling, small N so
-#       the whole run finishes in a few seconds and the metric scraper has
-#       a clear end-of-run summary to parse.
-# Expect: decode tok/s in the low-digit range on Termux aarch64 (a Snapdragon-
-#       class phone will out-run a budget one by 3-5x). TTFT dominated by the
-#       1.1GB weight-page cold read if weights are not in page cache.
+# What: first real inference benchmark against llama.cpp. Single prompt,
+#       greedy sampling (temp=0), small N so the whole run finishes in a
+#       few seconds and the metric scraper has a clear perf summary to parse.
+#
+# Expect: decode tok/s in the low-to-mid single digits on Termux aarch64.
+#         TTFT dominated by the 1.1GB weight-page cold read if weights are
+#         not already in page cache. Run twice back-to-back to see the
+#         warm-cache delta.
 
 name        = "tinyllama-q8-greedy-16"
 description = "TinyLlama 1.1B Q8_0 greedy decode, 16 tokens, single-turn"
-cmd         = "/data/data/com.termux/files/home/.sipllm/bin/llm-engine"
-args        = "/data/data/com.termux/files/home/prayog/models/tinyllama-q8.gguf -p \"The capital of France is\" -n 16 --greedy --threads 4"
+cmd         = "/data/data/com.termux/files/home/llama.cpp/build/bin/llama-cli"
+args        = "-m /data/data/com.termux/files/home/prayog/models/tinyllama-q8.gguf -p \"The capital of France is\" -n 16 --temp 0.0 -t 4 -st --simple-io --no-display-prompt"

@@ -5,13 +5,20 @@ Scope: everything under `~/prayog/`. For cross-cutting device truths see
 
 ## what this is
 
-`prayog` is a **research harness**, not an inference engine. It *drives*
-existing inference binaries (currently `~/.sipllm/bin/llm-engine`) and
-produces structured JSON reports. The lab's unique value is not inference —
-it's **reproducible measurement + comparison on-device, Android-first**.
+`prayog` is a **research harness**, not an inference engine. It *drives* an
+external inference binary and produces structured JSON reports. The lab's
+unique value is not inference — it's **reproducible measurement +
+comparison on-device, Android-first**.
 
-If you catch yourself writing a matmul kernel here, stop. That belongs in
-sipllm. Write it there and benchmark it from here.
+As of 0.6.0 the driven runtime is **llama.cpp's `llama-cli`** (at
+`~/llama.cpp/build/bin/llama-cli`). Earlier versions drove sipllm's
+`llm-engine`; sipllm was retired as a runtime on 2026-11-13. The decision
+is irreversible for this repo — don't re-wire sipllm paths. If you ever
+add a *second* runtime (ollama server, ExecuTorch), do it as a
+`--engine` flag that selects between them, not as a replacement.
+
+If you catch yourself writing a matmul kernel here, stop. That belongs
+upstream in llama.cpp. Write it there and benchmark it from here.
 
 ## architectural invariants
 

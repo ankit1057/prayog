@@ -35,11 +35,19 @@
 
 namespace prayog {
 
-constexpr const char* kVersion          = "0.5.0";
+constexpr const char* kVersion          = "0.6.0";
 constexpr const char* kSchema           = "prayog.run/2";
 constexpr const char* kSweepSchema      = "prayog.sweep/1";
 constexpr const char* kAgreeSchema      = "prayog.agree/1";
 constexpr const char* kAgreeBatchSchema = "prayog.agree-batch/1";
+
+// Default engine path. As of 0.6.0 prayog drives llama.cpp's `llama-cli`;
+// earlier versions drove sipllm's llm-engine, which was retired as a runtime.
+// Override with the `--engine` flag on any subcommand.
+static std::string default_engine() {
+    const char* h = std::getenv("HOME");
+    return (h ? std::string(h) : ".") + "/llama.cpp/build/bin/llama-cli";
+}
 
 static std::string trim(std::string_view s);
 
@@ -206,15 +214,32 @@ static BenchResult run_and_measure(const std::vector<std::string>& argv,
 }
 
 // --- inference-metric scraper ----------------------------------------------
-// Recognises the stderr lines emitted by sipllm's llm-engine (see sipllm/main.cpp
-// around line 1136 — the "decode: %.2f tok/s" summary block). Any line that
-// doesn't match is simply ignored, so this is safe to call on arbitrary output.
+// Recognises the stderr lines emitted by llama.cpp's llama-cli (produced by
+// llama_perf_context_print in src/llama-context.cpp). Example output:
+//
+//   llama_perf_context_print: prompt eval time =   412.80 ms /    6 tokens (   68.80 ms per token,    14.54 tokens per second)
+//   llama_perf_context_print:        eval time =  3800.40 ms /   31 runs   (  122.59 ms per token,     8.16 tokens per second)
+//   llama_perf_context_print:       total time =  4213.20 ms /   37 tokens
+//   llama_print_meta:          n_ctx    = 2048
+//
+// Any line that doesn't match is ignored, so this is safe on arbitrary output.
+// Metrics mapping:
+//   prefill_tok_s     ← "prompt eval time ... tokens per second" (second number)
+//   decode_tok_s      ← "eval time ... tokens per second"
+//   prompt_tokens     ← "prompt eval time ... / N tokens"
+//   generated         ← "eval time ... / N runs"
+//   ttft_s            ← first-token latency ≈ prompt_eval_time_ms / 1000
+//   context_max       ← n_ctx from print_meta (or `--ctx-size`)
+//
+// llama.cpp doesn't report weights_resident / streamed / kv_cache in the same
+// line-oriented way sipllm did; those fields may be 0 unless we parse the model
+// loader lines separately. Extend when needed.
 
 static bool scan_double(std::string_view haystack, std::string_view needle, double& out) {
     auto i = haystack.find(needle);
     if (i == std::string_view::npos) return false;
     i += needle.size();
-    while (i < haystack.size() && (haystack[i] == ' ' || haystack[i] == '\t')) ++i;
+    while (i < haystack.size() && (haystack[i] == ' ' || haystack[i] == '\t' || haystack[i] == '=')) ++i;
     std::string num;
     while (i < haystack.size() && (std::isdigit(static_cast<unsigned char>(haystack[i])) ||
                                    haystack[i] == '.' || haystack[i] == '-' ||
@@ -233,34 +258,124 @@ static bool scan_int(std::string_view haystack, std::string_view needle, int& ou
     return true;
 }
 
+// Pull the second "tokens per second" value on a line that starts with `anchor`.
+// llama.cpp lines look like:
+//   "...eval time =   3800.40 ms /   31 runs   ( 122.59 ms per token,   8.16 tokens per second)"
+// We want the final 8.16 in that example.
+static bool scan_tokens_per_second(const std::string& text, std::string_view anchor, double& out) {
+    auto i = text.find(anchor);
+    if (i == std::string::npos) return false;
+    auto eol = text.find('\n', i);
+    std::string line = text.substr(i, eol == std::string::npos ? std::string::npos : eol - i);
+    auto tps = line.find("tokens per second");
+    if (tps == std::string::npos) return false;
+    // Walk backwards past ") " to the trailing number.
+    size_t j = tps;
+    while (j > 0 && (line[j-1] == ' ' || line[j-1] == '\t')) --j;
+    size_t end = j;
+    while (j > 0 && (std::isdigit(static_cast<unsigned char>(line[j-1])) ||
+                     line[j-1] == '.' || line[j-1] == '-' || line[j-1] == 'e' || line[j-1] == '+')) --j;
+    std::string num = line.substr(j, end - j);
+    if (num.empty()) return false;
+    try { out = std::stod(num); } catch (...) { return false; }
+    return true;
+}
+
+// Parse the "N tokens" or "N runs" count after the first "=" or "/" on a perf line.
+static bool scan_count_after_slash(const std::string& text, std::string_view anchor, int& out) {
+    auto i = text.find(anchor);
+    if (i == std::string::npos) return false;
+    auto eol = text.find('\n', i);
+    std::string line = text.substr(i, eol == std::string::npos ? std::string::npos : eol - i);
+    auto slash = line.find('/');
+    if (slash == std::string::npos) return false;
+    size_t j = slash + 1;
+    while (j < line.size() && (line[j] == ' ' || line[j] == '\t')) ++j;
+    std::string num;
+    while (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j]))) num.push_back(line[j++]);
+    if (num.empty()) return false;
+    try { out = std::stoi(num); } catch (...) { return false; }
+    return true;
+}
+
+// Timing-time-ms helper: pull the first "N.NN ms" value on a line.
+static bool scan_time_ms(const std::string& text, std::string_view anchor, double& out_sec) {
+    auto i = text.find(anchor);
+    if (i == std::string::npos) return false;
+    auto eol = text.find('\n', i);
+    std::string line = text.substr(i, eol == std::string::npos ? std::string::npos : eol - i);
+    auto eq = line.find('=');
+    if (eq == std::string::npos) return false;
+    size_t j = eq + 1;
+    while (j < line.size() && (line[j] == ' ' || line[j] == '\t')) ++j;
+    std::string num;
+    while (j < line.size() && (std::isdigit(static_cast<unsigned char>(line[j])) || line[j] == '.')) num.push_back(line[j++]);
+    if (num.empty()) return false;
+    try { out_sec = std::stod(num) / 1000.0; } catch (...) { return false; }
+    return true;
+}
+
+// Pull a number after `label:` inside a one-line `[ ... ]` metric block, e.g.
+// from "[ Prompt: 108.7 t/s | Generation: 22.3 t/s ]" extract 108.7 given
+// label="Prompt:" and 22.3 given label="Generation:". Returns false if the
+// label is absent or the characters after it aren't parseable as a number.
+static bool scan_bracket_metric(const std::string& text, std::string_view label, double& out) {
+    auto i = text.find(label);
+    if (i == std::string::npos) return false;
+    i += label.size();
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+    std::string num;
+    while (i < text.size() && (std::isdigit(static_cast<unsigned char>(text[i])) ||
+                               text[i] == '.' || text[i] == '-' || text[i] == 'e' || text[i] == '+')) {
+        num.push_back(text[i++]);
+    }
+    if (num.empty()) return false;
+    try { out = std::stod(num); } catch (...) { return false; }
+    return true;
+}
+
 static InferenceMetrics parse_inference_metrics(const std::string& stderr_full,
                                                 const std::string& stdout_full) {
     InferenceMetrics m;
-    // Metrics come on stderr from llm-engine; stdout carries generated tokens.
-    // Scan both to be safe.
-    auto hunt = [&](const std::string& src) {
-        if (scan_double(src, "decode:",          m.decode_tok_s))      m.present = true;
-        if (scan_double(src, "prefill:",         m.prefill_tok_s))     m.present = true;
-        if (scan_double(src, "TTFT:",            m.ttft_s))            m.present = true;
-        scan_int   (src, "prompt tokens:",       m.prompt_tokens);
-        scan_int   (src, "generated:",           m.generated);
-        scan_double(src, "weights resident:",    m.weights_resident_mb);
-        scan_double(src, "kv cache:",            m.kv_cache_mb);
-        scan_double(src, "streamed:",            m.streamed_mb);
-        // "context:         N / M" — scan_int picks up the first number.
-        scan_int   (src, "context:",             m.context_used);
-        // For context_max, find the "/" after "context:" and read past it.
-        auto i = src.find("context:");
-        if (i != std::string::npos) {
-            auto slash = src.find('/', i);
-            if (slash != std::string::npos) {
-                double dmax = 0.0;
-                if (scan_double(src.substr(slash), "/", dmax)) m.context_max = static_cast<int>(dmax);
-            }
-        }
-    };
-    hunt(stderr_full);
-    hunt(stdout_full);
+
+    // Format 1 (classic llama_perf_context_print, stderr).
+    //
+    // Observed from llama-simple and older llama-cli builds. Provides
+    // prefill/decode tok/s, token counts, and TTFT.
+    {
+        const std::string& s = stderr_full;
+        double prefill = 0, decode = 0;
+        if (scan_tokens_per_second(s, "prompt eval time", prefill)) { m.prefill_tok_s = prefill; m.present = true; }
+        if (scan_tokens_per_second(s, "eval time",        decode))  { m.decode_tok_s  = decode;  m.present = true; }
+        // find() returns first occurrence, so "prompt eval time" is grabbed
+        // first and "eval time" matches the true decode line because it
+        // appears later in stderr. If llama.cpp ever flips the print order,
+        // this breaks; scan the second occurrence instead.
+
+        int pt = 0, gen = 0;
+        if (scan_count_after_slash(s, "prompt eval time", pt))  m.prompt_tokens = pt;
+        if (scan_count_after_slash(s, "eval time",        gen)) m.generated     = gen;
+
+        double prefill_ms_sec = 0;
+        if (scan_time_ms(s, "prompt eval time", prefill_ms_sec)) m.ttft_s = prefill_ms_sec;
+
+        scan_int(s, "n_ctx", m.context_max);
+    }
+
+    // Format 2 (chat-mode llama-cli, stdout). Observed on builds >= b1-5676dfb.
+    //
+    //     "[ Prompt: 108.7 t/s | Generation: 22.3 t/s ]"
+    //
+    // Only tok/s is available — no token counts, no TTFT, no n_ctx. If the
+    // classic stderr format is also present, trust it and skip this (format 1
+    // carries more data). If both are missing, scan this as a fallback so a
+    // chat-mode llama-cli run still produces non-zero metrics.
+    if (!m.present) {
+        double prefill = 0, decode = 0;
+        if (scan_bracket_metric(stdout_full, "Prompt:",     prefill)) { m.prefill_tok_s = prefill; m.present = true; }
+        if (scan_bracket_metric(stdout_full, "Generation:", decode))  { m.decode_tok_s  = decode;  m.present = true; }
+    }
+
     return m;
 }
 
@@ -378,7 +493,20 @@ static std::optional<Experiment> load_experiment(const std::string& path) {
         if (eq == std::string::npos) continue;
         std::string key = trim(std::string_view(line).substr(0, eq));
         std::string val = trim(std::string_view(line).substr(eq + 1));
-        if (val.size() >= 2 && val.front() == '"' && val.back() == '"') val = val.substr(1, val.size() - 2);
+        if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+            val = val.substr(1, val.size() - 2);
+            // TOML basic-string escapes: \" -> ", \\ -> \. Without this, the
+            // subsequent split_args() sees the literal backslash in a non-
+            // quoted context, keeps it, and the following unescaped " opens a
+            // quote that swallows the rest of the line.
+            std::string un; un.reserve(val.size());
+            for (size_t i = 0; i < val.size(); ++i) {
+                if (val[i] == '\\' && i + 1 < val.size() && (val[i+1] == '"' || val[i+1] == '\\')) {
+                    un.push_back(val[++i]);
+                } else un.push_back(val[i]);
+            }
+            val = std::move(un);
+        }
         if (key == "name")        e.name = val;
         else if (key == "description") e.description = val;
         else if (key == "cmd")    e.cmd = val;
@@ -480,11 +608,11 @@ static int cmd_run(int argc, char** argv) {
     cmd.push_back(exp->cmd);
     for (auto& a : exp->args) cmd.push_back(a);
     auto r = run_and_measure(cmd);
-    // Any experiment whose cmd ends in "llm-engine" is auto-parsed for inference
-    // metrics. The scraper is cheap and no-op on non-matching output, so even
-    // false positives cost nothing.
-    bool is_llm = exp->cmd.find("llm-engine") != std::string::npos
-               || exp->cmd.find("sipllm")     != std::string::npos;
+    // Any experiment whose cmd looks like an inference binary is auto-parsed.
+    // The scraper is cheap and no-op on non-matching output, so false positives
+    // cost nothing. Current patterns: llama-cli, llama-bench.
+    bool is_llm = exp->cmd.find("llama-cli")   != std::string::npos
+               || exp->cmd.find("llama-bench") != std::string::npos;
     if (is_llm) r.inference = parse_inference_metrics(r.stderr_full, r.stdout_full);
     auto json = serialize(r, exp->name);
     auto out = next_report_path(exp->name);
@@ -623,8 +751,9 @@ static std::string resolve_model_file(const std::string& stem, const std::string
     std::string url = user_registry_url(full_name);
     if (url.empty()) url = builtin_model_url(full_name);
     if (url.empty()) return "";
-    // Look under $PRAYOG_HOME/models AND $HOME/.sipllm/models (sipllm may have
-    // pulled the same file; we accept either so you don't have to double-pull).
+    // Look under $PRAYOG_HOME/models first. The legacy ~/.sipllm/models path
+    // is kept as a fallback so previously-pulled GGUFs (bytes are the same)
+    // still resolve without a re-download.
     std::string base = basename_of(url);
     std::vector<std::string> candidates = {
         models_dir() + "/" + base,
@@ -645,8 +774,7 @@ static int cmd_sweep(int argc, char** argv) {
     std::string prompt  = "The capital of France is";
     int         n       = 16;
     int         threads = 4;
-    std::string engine  = (std::getenv("HOME") ? std::string(std::getenv("HOME")) : ".")
-                          + "/.sipllm/bin/llm-engine";
+    std::string engine  = default_engine();
 
     for (int i = 2; i < argc; ++i) {
         std::string_view f = argv[i];
@@ -699,11 +827,14 @@ static int cmd_sweep(int argc, char** argv) {
         if (::stat(path.c_str(), &st) == 0) r.model_size_mb = st.st_size / 1048576.0;
 
         std::vector<std::string> cmd = {
-            engine, path,
+            engine, "-m", path,
             "-p", prompt,
             "-n", std::to_string(n),
-            "--greedy",
-            "--threads", std::to_string(threads),
+            "--temp", "0.0",
+            "-t", std::to_string(threads),
+            "-st",
+            "--simple-io",
+            "--no-display-prompt",
         };
         r.bench = run_and_measure(cmd);
         r.bench.inference = parse_inference_metrics(r.bench.stderr_full, r.bench.stdout_full);
@@ -828,8 +959,7 @@ static int cmd_agree(int argc, char** argv) {
     int         n       = 32;
     int         seed    = 42;
     int         threads = 4;
-    std::string engine  = (std::getenv("HOME") ? std::string(std::getenv("HOME")) : ".")
-                          + "/.sipllm/bin/llm-engine";
+    std::string engine  = default_engine();
 
     for (int i = 2; i < argc; ++i) {
         std::string_view f = argv[i];
@@ -867,12 +997,15 @@ static int cmd_agree(int argc, char** argv) {
         o.quant = q;
         o.model_path = path;
         std::vector<std::string> cmd = {
-            engine, path,
+            engine, "-m", path,
             "-p", prompt,
             "-n", std::to_string(n),
-            "--greedy",
-            "--threads", std::to_string(threads),
-            "--seed", std::to_string(seed),
+            "--temp", "0.0",
+            "-t", std::to_string(threads),
+            "-s", std::to_string(seed),
+            "-st",
+            "--simple-io",
+            "--no-display-prompt",
         };
         o.bench = run_and_measure(cmd);
         o.bench.inference = parse_inference_metrics(o.bench.stderr_full, o.bench.stdout_full);
@@ -1037,8 +1170,7 @@ static int cmd_agree_batch(int argc, char** argv) {
     int         n       = 24;
     int         seed    = 42;
     int         threads = 4;
-    std::string engine  = (std::getenv("HOME") ? std::string(std::getenv("HOME")) : ".")
-                          + "/.sipllm/bin/llm-engine";
+    std::string engine  = default_engine();
 
     for (int i = 2; i < argc; ++i) {
         std::string_view f = argv[i];
@@ -1088,12 +1220,15 @@ static int cmd_agree_batch(int argc, char** argv) {
 
     auto run_one = [&](const std::string& model_path, const std::string& prompt) {
         std::vector<std::string> cmd = {
-            engine, model_path,
+            engine, "-m", model_path,
             "-p", prompt,
             "-n", std::to_string(n),
-            "--greedy",
-            "--threads", std::to_string(threads),
-            "--seed", std::to_string(seed),
+            "--temp", "0.0",
+            "-t", std::to_string(threads),
+            "-s", std::to_string(seed),
+            "-st",
+            "--simple-io",
+            "--no-display-prompt",
         };
         return run_and_measure(cmd);
     };
