@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <map>
@@ -34,7 +35,10 @@
 
 namespace prayog {
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.2.0";
+constexpr const char* kSchema  = "prayog.run/2";
+
+static std::string trim(std::string_view s);
 
 // --- utilities -------------------------------------------------------------
 
@@ -45,6 +49,7 @@ static std::string home_dir() {
 }
 
 static std::string reports_dir() { return home_dir() + "/reports"; }
+static std::string models_dir()  { return home_dir() + "/models"; }
 
 static void mkpath(const std::string& p) {
     std::string cur;
@@ -88,6 +93,20 @@ static std::string json_escape(std::string_view s) {
 
 // --- bench: run a command, measure wall + rss + exit -----------------------
 
+struct InferenceMetrics {
+    bool present = false;
+    double decode_tok_s   = 0.0;
+    double prefill_tok_s  = 0.0;
+    double ttft_s         = 0.0;
+    int    prompt_tokens  = 0;
+    int    generated      = 0;
+    double weights_resident_mb = 0.0;
+    double kv_cache_mb    = 0.0;
+    double streamed_mb    = 0.0;
+    int    context_used   = 0;
+    int    context_max    = 0;
+};
+
 struct BenchResult {
     std::string cmd;
     std::vector<std::string> argv;
@@ -97,12 +116,17 @@ struct BenchResult {
     long maxrss_kb = 0;      // child RU_MAXRSS, kilobytes on Linux
     long utime_us = 0;
     long stime_us = 0;
-    std::string stdout_sample; // first N bytes
+    std::string stdout_full; // full captured (capped at 1 MB) — used for parsing
+    std::string stderr_full;
+    std::string stdout_sample; // first N bytes — used for display
     std::string stderr_sample;
     std::string started_at;
+    InferenceMetrics inference;
 };
 
-static BenchResult run_and_measure(const std::vector<std::string>& argv, size_t sample_bytes = 4096) {
+static BenchResult run_and_measure(const std::vector<std::string>& argv,
+                                   size_t sample_bytes = 4096,
+                                   size_t full_bytes   = 1 << 20) {
     BenchResult r;
     r.argv = argv;
     r.cmd = argv.empty() ? "" : argv[0];
@@ -140,21 +164,24 @@ static BenchResult run_and_measure(const std::vector<std::string>& argv, size_t 
     close(out_pipe[1]);
     close(err_pipe[1]);
 
-    auto drain = [&](int fd, std::string& sink) {
+    auto drain = [&](int fd, std::string& full) {
         char buf[4096];
         while (true) {
             ssize_t n = read(fd, buf, sizeof(buf));
             if (n <= 0) break;
-            if (sink.size() < sample_bytes) {
-                size_t take = std::min<size_t>(static_cast<size_t>(n), sample_bytes - sink.size());
-                sink.append(buf, take);
+            if (full.size() < full_bytes) {
+                size_t take = std::min<size_t>(static_cast<size_t>(n), full_bytes - full.size());
+                full.append(buf, take);
             }
         }
     };
-    // Simple serial drain; child output is small for the kinds of commands we run.
-    // For long-running streams, a select()/poll() loop would be better — add later.
-    drain(out_pipe[0], r.stdout_sample);
-    drain(err_pipe[0], r.stderr_sample);
+    // Simple serial drain: stdout then stderr. Fine for the batch workloads we
+    // run (help text, one short inference). For long streams of tokens a poll()
+    // loop would be better — add when a real interactive mode lands.
+    drain(out_pipe[0], r.stdout_full);
+    drain(err_pipe[0], r.stderr_full);
+    r.stdout_sample = r.stdout_full.substr(0, std::min(r.stdout_full.size(), sample_bytes));
+    r.stderr_sample = r.stderr_full.substr(0, std::min(r.stderr_full.size(), sample_bytes));
     close(out_pipe[0]);
     close(err_pipe[0]);
 
@@ -175,10 +202,69 @@ static BenchResult run_and_measure(const std::vector<std::string>& argv, size_t 
     return r;
 }
 
+// --- inference-metric scraper ----------------------------------------------
+// Recognises the stderr lines emitted by sipllm's llm-engine (see sipllm/main.cpp
+// around line 1136 — the "decode: %.2f tok/s" summary block). Any line that
+// doesn't match is simply ignored, so this is safe to call on arbitrary output.
+
+static bool scan_double(std::string_view haystack, std::string_view needle, double& out) {
+    auto i = haystack.find(needle);
+    if (i == std::string_view::npos) return false;
+    i += needle.size();
+    while (i < haystack.size() && (haystack[i] == ' ' || haystack[i] == '\t')) ++i;
+    std::string num;
+    while (i < haystack.size() && (std::isdigit(static_cast<unsigned char>(haystack[i])) ||
+                                   haystack[i] == '.' || haystack[i] == '-' ||
+                                   haystack[i] == 'e' || haystack[i] == '+')) {
+        num.push_back(haystack[i++]);
+    }
+    if (num.empty()) return false;
+    try { out = std::stod(num); } catch (...) { return false; }
+    return true;
+}
+
+static bool scan_int(std::string_view haystack, std::string_view needle, int& out) {
+    double tmp = 0.0;
+    if (!scan_double(haystack, needle, tmp)) return false;
+    out = static_cast<int>(tmp);
+    return true;
+}
+
+static InferenceMetrics parse_inference_metrics(const std::string& stderr_full,
+                                                const std::string& stdout_full) {
+    InferenceMetrics m;
+    // Metrics come on stderr from llm-engine; stdout carries generated tokens.
+    // Scan both to be safe.
+    auto hunt = [&](const std::string& src) {
+        if (scan_double(src, "decode:",          m.decode_tok_s))      m.present = true;
+        if (scan_double(src, "prefill:",         m.prefill_tok_s))     m.present = true;
+        if (scan_double(src, "TTFT:",            m.ttft_s))            m.present = true;
+        scan_int   (src, "prompt tokens:",       m.prompt_tokens);
+        scan_int   (src, "generated:",           m.generated);
+        scan_double(src, "weights resident:",    m.weights_resident_mb);
+        scan_double(src, "kv cache:",            m.kv_cache_mb);
+        scan_double(src, "streamed:",            m.streamed_mb);
+        // "context:         N / M" — scan_int picks up the first number.
+        scan_int   (src, "context:",             m.context_used);
+        // For context_max, find the "/" after "context:" and read past it.
+        auto i = src.find("context:");
+        if (i != std::string::npos) {
+            auto slash = src.find('/', i);
+            if (slash != std::string::npos) {
+                double dmax = 0.0;
+                if (scan_double(src.substr(slash), "/", dmax)) m.context_max = static_cast<int>(dmax);
+            }
+        }
+    };
+    hunt(stderr_full);
+    hunt(stdout_full);
+    return m;
+}
+
 static std::string serialize(const BenchResult& r, const std::string& experiment = "") {
     std::ostringstream o;
     o << "{\n";
-    o << "  \"schema\": \"prayog.run/1\",\n";
+    o << "  \"schema\": \"" << kSchema << "\",\n";
     o << "  \"started_at\": \"" << r.started_at << "\",\n";
     if (!experiment.empty())
         o << "  \"experiment\": \"" << json_escape(experiment) << "\",\n";
@@ -198,6 +284,21 @@ static std::string serialize(const BenchResult& r, const std::string& experiment
     o << "    \"utime_us\": " << r.utime_us << ",\n";
     o << "    \"stime_us\": " << r.stime_us << "\n";
     o << "  },\n";
+    if (r.inference.present) {
+        const auto& m = r.inference;
+        o << "  \"inference\": {\n";
+        o << "    \"decode_tok_s\": "       << m.decode_tok_s      << ",\n";
+        o << "    \"prefill_tok_s\": "      << m.prefill_tok_s     << ",\n";
+        o << "    \"ttft_s\": "             << m.ttft_s            << ",\n";
+        o << "    \"prompt_tokens\": "      << m.prompt_tokens     << ",\n";
+        o << "    \"generated\": "          << m.generated         << ",\n";
+        o << "    \"weights_resident_mb\": "<< m.weights_resident_mb<< ",\n";
+        o << "    \"kv_cache_mb\": "        << m.kv_cache_mb       << ",\n";
+        o << "    \"streamed_mb\": "        << m.streamed_mb       << ",\n";
+        o << "    \"context_used\": "       << m.context_used      << ",\n";
+        o << "    \"context_max\": "        << m.context_max       << "\n";
+        o << "  },\n";
+    }
     o << "  \"stdout_sample\": \"" << json_escape(r.stdout_sample) << "\",\n";
     o << "  \"stderr_sample\": \"" << json_escape(r.stderr_sample) << "\"\n";
     o << "}\n";
@@ -318,22 +419,35 @@ static std::string slurp(const std::string& path) {
 
 // --- subcommands -----------------------------------------------------------
 
+static void print_inference_summary(const InferenceMetrics& m) {
+    if (!m.present) return;
+    std::fprintf(stderr,
+        "        inference: decode=%.2f tok/s  prefill=%.2f tok/s  ttft=%.3fs"
+        "  prompt=%d  gen=%d  weights=%.1fMB  streamed=%.1fMB\n",
+        m.decode_tok_s, m.prefill_tok_s, m.ttft_s,
+        m.prompt_tokens, m.generated,
+        m.weights_resident_mb, m.streamed_mb);
+}
+
 static int cmd_bench(int argc, char** argv) {
-    // prayog bench [--experiment NAME] <cmd> [args...]
+    // prayog bench [--experiment NAME] [--inference] <cmd> [args...]
     std::string experiment;
+    bool inference = false;
     int i = 2;
     while (i < argc && std::string_view(argv[i]).substr(0, 2) == "--") {
         std::string_view flag = argv[i];
         if (flag == "--experiment" && i + 1 < argc) { experiment = argv[i+1]; i += 2; }
-        else if (flag == "--") { ++i; break; }
+        else if (flag == "--inference")             { inference = true; ++i; }
+        else if (flag == "--")                      { ++i; break; }
         else { std::fprintf(stderr, "prayog bench: unknown flag %s\n", argv[i]); return 2; }
     }
     if (i >= argc) {
-        std::fprintf(stderr, "usage: prayog bench [--experiment NAME] <cmd> [args...]\n");
+        std::fprintf(stderr, "usage: prayog bench [--experiment NAME] [--inference] <cmd> [args...]\n");
         return 2;
     }
     std::vector<std::string> cmd(argv + i, argv + argc);
     auto r = run_and_measure(cmd);
+    if (inference) r.inference = parse_inference_metrics(r.stderr_full, r.stdout_full);
     auto json = serialize(r, experiment);
     auto out = next_report_path(experiment);
     std::ofstream f(out);
@@ -341,6 +455,7 @@ static int cmd_bench(int argc, char** argv) {
     std::fprintf(stderr, "prayog: wrote %s\n", out.c_str());
     std::fprintf(stderr, "        wall=%.3fs maxrss=%.1fMB exit=%d\n",
                  r.wall_sec, r.maxrss_kb / 1024.0, r.exit_code);
+    print_inference_summary(r.inference);
     std::fwrite(json.data(), 1, json.size(), stdout);
     return r.exit_code == 0 ? 0 : 1;
 }
@@ -353,6 +468,12 @@ static int cmd_run(int argc, char** argv) {
     cmd.push_back(exp->cmd);
     for (auto& a : exp->args) cmd.push_back(a);
     auto r = run_and_measure(cmd);
+    // Any experiment whose cmd ends in "llm-engine" is auto-parsed for inference
+    // metrics. The scraper is cheap and no-op on non-matching output, so even
+    // false positives cost nothing.
+    bool is_llm = exp->cmd.find("llm-engine") != std::string::npos
+               || exp->cmd.find("sipllm")     != std::string::npos;
+    if (is_llm) r.inference = parse_inference_metrics(r.stderr_full, r.stdout_full);
     auto json = serialize(r, exp->name);
     auto out = next_report_path(exp->name);
     std::ofstream f(out);
@@ -361,7 +482,129 @@ static int cmd_run(int argc, char** argv) {
     std::fprintf(stderr, "        wrote %s\n", out.c_str());
     std::fprintf(stderr, "        wall=%.3fs maxrss=%.1fMB exit=%d\n",
                  r.wall_sec, r.maxrss_kb / 1024.0, r.exit_code);
+    print_inference_summary(r.inference);
     return r.exit_code == 0 ? 0 : 1;
+}
+
+// --- pull: download a GGUF by name or URL ----------------------------------
+// We delegate the transport to curl rather than reinvent HTTP. Named models
+// come from a tiny built-in registry (TinyLlama, SmolLM2 defaults) and from
+// an optional user file at $PRAYOG_HOME/models.conf (TSV: name<TAB>url).
+
+static std::string builtin_model_url(std::string_view name) {
+    // Mirrors a subset of sipllm's registry — keep this short; the models.conf
+    // file is the escape hatch for anything bigger.
+    if (name == "tinyllama" || name == "tinyllama:q4_k_m")
+        return "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+    if (name == "tinyllama:q8_0")
+        return "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
+    if (name == "tinyllama:q5_k_m")
+        return "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf";
+    if (name == "smollm2:135m")
+        return "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf";
+    if (name == "smollm2:360m")
+        return "https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q8_0.gguf";
+    return "";
+}
+
+static std::string user_registry_url(std::string_view name) {
+    std::string path = home_dir() + "/models.conf";
+    std::ifstream in(path);
+    if (!in) return "";
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto tab = line.find('\t');
+        if (tab == std::string::npos) tab = line.find(' ');
+        if (tab == std::string::npos) continue;
+        if (std::string_view(line).substr(0, tab) == name) return trim(std::string_view(line).substr(tab + 1));
+    }
+    return "";
+}
+
+static std::string basename_of(const std::string& url) {
+    auto q = url.find('?');
+    std::string clean = q == std::string::npos ? url : url.substr(0, q);
+    auto s = clean.find_last_of('/');
+    return s == std::string::npos ? clean : clean.substr(s + 1);
+}
+
+static int cmd_pull(int argc, char** argv) {
+    // prayog pull <name|url> [--as filename]
+    if (argc < 3) {
+        std::fprintf(stderr,
+            "usage: prayog pull <name|url> [--as filename]\n"
+            "  known: tinyllama, tinyllama:q8_0, tinyllama:q5_k_m, smollm2:135m, smollm2:360m\n"
+            "  user registry: %s/models.conf (TSV: name<TAB>url)\n",
+            home_dir().c_str());
+        return 2;
+    }
+    std::string target = argv[2];
+    std::string override_name;
+    for (int j = 3; j < argc; ++j) {
+        if (std::string_view(argv[j]) == "--as" && j + 1 < argc) { override_name = argv[j+1]; ++j; }
+    }
+
+    std::string url;
+    if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) {
+        url = target;
+    } else {
+        url = user_registry_url(target);
+        if (url.empty()) url = builtin_model_url(target);
+        if (url.empty()) {
+            std::fprintf(stderr, "prayog pull: unknown model '%s'. Pass a URL or add to %s/models.conf\n",
+                         target.c_str(), home_dir().c_str());
+            return 1;
+        }
+    }
+
+    mkpath(models_dir());
+    std::string out_path = models_dir() + "/" + (override_name.empty() ? basename_of(url) : override_name);
+
+    std::fprintf(stderr, "prayog: fetching %s\n", url.c_str());
+    std::fprintf(stderr, "        to     %s\n", out_path.c_str());
+
+    std::vector<std::string> cmd = {
+        "curl", "-L", "--fail", "--progress-bar",
+        "-C", "-",                 // resume if partial file exists
+        "-o", out_path,
+        url,
+    };
+    auto r = run_and_measure(cmd, /*sample_bytes=*/256, /*full_bytes=*/4096);
+    if (r.exit_code != 0) {
+        std::fprintf(stderr, "prayog pull: curl exit %d\n%s\n", r.exit_code, r.stderr_sample.c_str());
+        return r.exit_code;
+    }
+    struct stat st{};
+    if (::stat(out_path.c_str(), &st) == 0) {
+        std::fprintf(stderr, "prayog: %s  (%.1f MB)\n", out_path.c_str(), st.st_size / 1048576.0);
+    }
+    return 0;
+}
+
+static int cmd_models(int /*argc*/, char** /*argv*/) {
+    std::string dir = models_dir();
+    DIR* d = opendir(dir.c_str());
+    if (!d) {
+        std::fprintf(stderr, "prayog: no models yet (dir %s is empty)\n", dir.c_str());
+        return 0;
+    }
+    std::vector<std::pair<std::string, off_t>> entries;
+    while (auto* ent = readdir(d)) {
+        if (ent->d_name[0] == '.') continue;
+        std::string full = dir + "/" + ent->d_name;
+        struct stat st{};
+        if (::stat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+            entries.emplace_back(ent->d_name, st.st_size);
+    }
+    closedir(d);
+    std::sort(entries.begin(), entries.end());
+    std::printf("models in %s:\n", dir.c_str());
+    if (entries.empty()) { std::printf("  (none)\n"); return 0; }
+    for (auto& [n, sz] : entries) {
+        std::printf("  %-50s  %7.1f MB\n", n.c_str(), sz / 1048576.0);
+    }
+    return 0;
 }
 
 static int cmd_compare(int argc, char** argv) {
@@ -416,8 +659,10 @@ static int usage() {
         "prayog — on-device AI research lab\n"
         "\n"
         "usage:\n"
-        "  prayog bench [--experiment NAME] <cmd> [args...]\n"
-        "  prayog run   <experiment.toml>\n"
+        "  prayog bench [--experiment NAME] [--inference] <cmd> [args...]\n"
+        "  prayog run     <experiment.toml>\n"
+        "  prayog pull    <name|url> [--as filename]\n"
+        "  prayog models\n"
         "  prayog compare <a.json> <b.json>\n"
         "  prayog report  <run.json>\n"
         "  prayog version\n"
@@ -434,6 +679,8 @@ int main(int argc, char** argv) {
     std::string_view sub = argv[1];
     if (sub == "bench")   return prayog::cmd_bench(argc, argv);
     if (sub == "run")     return prayog::cmd_run(argc, argv);
+    if (sub == "pull")    return prayog::cmd_pull(argc, argv);
+    if (sub == "models")  return prayog::cmd_models(argc, argv);
     if (sub == "compare") return prayog::cmd_compare(argc, argv);
     if (sub == "report")  return prayog::cmd_report(argc, argv);
     if (sub == "version" || sub == "--version" || sub == "-v") return prayog::cmd_version();

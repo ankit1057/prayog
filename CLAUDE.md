@@ -18,10 +18,11 @@ sipllm. Write it there and benchmark it from here.
 - **Zero dependencies.** The engine is a single `.cpp` + a `Makefile`. No
   third-party libs. Match sipllm's anti-framework stance: if the stdlib can
   do it in 30 lines, use the stdlib.
-- **Reports are the contract.** The JSON schema `prayog.run/1` written by
-  `engine/src/prayog.cpp` is the sole handoff between engine and app. Any
-  new metric must land in JSON; the Android `Report.kt` is a mirror, not
-  a definition.
+- **Reports are the contract.** The JSON schema `prayog.run/2` (as of 0.2.0)
+  written by `engine/src/prayog.cpp` is the sole handoff between engine and
+  app. Any new metric must land in JSON; the Android `Report.kt` is a mirror,
+  not a definition. Schema bumps are backwards-additive — v1 readers must
+  still parse v2 output (unknown fields are dropped).
 - **Android app is read-only.** It never mutates reports, never spawns
   processes. The engine CLI owns measurement; the app owns display. This
   one-way boundary makes the app testable without Termux.
@@ -61,16 +62,17 @@ Clang 21.1.8 for aarch64 Android target. `-O2 -march=armv8-a`. Binary at
   "Run from phone" is a separate future spike (ProcessBuilder + jniLibs
   extraction) — not v1.
 
-## known gaps (as of walking-skeleton)
+## known gaps (as of 0.2.0)
 
 - No perplexity eval harness yet. `prayog eval <model> <wikitext.txt>`
-  is the natural next subcommand — needs a token-stream parser on `llm-engine`
-  output.
-- No quant-sweep script. Would live in `scripts/sweep-quants.sh`,
-  invoking `prayog run` N times over a matrix.
+  is the natural next subcommand — needs a tokenizer round-trip and a logit
+  dump path on `llm-engine`.
+- No quant-sweep runner. Would live as `prayog sweep <model-stem>`,
+  pulling each quant variant and calling `run` over a matrix.
 - Android app: no run-triggering, no history graphing, no diff view. All
-  reasonable adds once the JSON schema stops churning.
-- Repo is not under git yet. `git init && git add .` when ready to publish.
+  reasonable adds now that the JSON schema has stabilised at v2.
+- Download resumability relies on curl's `-C -`. If a partial file is
+  corrupt, delete it and retry.
 
 ## how this file stays honest
 

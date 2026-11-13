@@ -65,11 +65,32 @@ at a sideloaded SDK) but slow — the walking skeleton assumes a workstation bui
 
 | subcommand                 | what it does |
 |----------------------------|--------------|
-| `prayog bench CMD [ARGS]`  | time one command, write report |
-| `prayog run EXP.toml`      | run a declared experiment |
+| `prayog bench [--inference] CMD [ARGS]`  | time one command, write report; `--inference` scrapes llm-engine metrics |
+| `prayog run EXP.toml`      | run a declared experiment (auto-scrapes if cmd is llm-engine) |
+| `prayog pull NAME\|URL [--as FILE]` | download a GGUF to `$PRAYOG_HOME/models/` |
+| `prayog models`            | list downloaded models with sizes |
 | `prayog compare A.json B.json` | side-by-side metric diff |
 | `prayog report R.json`     | pretty-print one report as markdown |
 | `prayog version`           | version + paths |
+
+### known model names
+
+`tinyllama`, `tinyllama:q8_0`, `tinyllama:q5_k_m`, `smollm2:135m`, `smollm2:360m`.
+Add your own at `$PRAYOG_HOME/models.conf` (one line per model: `name<TAB>url`).
+
+### reference inference numbers (this device, 2026-11-13)
+
+TinyLlama 1.1B Q8_0, greedy, 16 tokens, 4 threads, Termux aarch64:
+
+| metric   | value |
+|----------|-------|
+| decode   | 4.19 tok/s |
+| prefill  | 12.72 tok/s |
+| ttft     | 629 ms |
+| weights resident | 1099 MB |
+| streamed from disk | 1030 MB |
+| peak rss | 1154 MB |
+| wall     | 5.47 s |
 
 ## experiment file format
 

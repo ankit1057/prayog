@@ -4,14 +4,25 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Minimal model of a `prayog run` JSON report. Mirrors the schema emitted by
- * engine/src/prayog.cpp — keep in sync if you add fields there.
- *
- * We parse with org.json (stdlib on Android) rather than pulling in Moshi/
- * kotlinx.serialization for a walking skeleton.
+ * Mirror of the JSON schema `prayog.run/2` emitted by engine/src/prayog.cpp.
+ * Backwards-compatible with `prayog.run/1`: missing inference block → null.
  */
+data class Inference(
+    val decodeTokS: Double,
+    val prefillTokS: Double,
+    val ttftS: Double,
+    val promptTokens: Int,
+    val generated: Int,
+    val weightsResidentMb: Double,
+    val kvCacheMb: Double,
+    val streamedMb: Double,
+    val contextUsed: Int,
+    val contextMax: Int,
+)
+
 data class Report(
     val path: String,
+    val schema: String,
     val startedAt: String,
     val experiment: String,
     val cmd: String,
@@ -20,9 +31,12 @@ data class Report(
     val signal: Int,
     val wallSec: Double,
     val maxRssMb: Double,
+    val inference: Inference?,
     val stdoutSample: String,
     val stderrSample: String,
 ) {
+    val isInference: Boolean get() = inference != null
+
     companion object {
         fun parse(file: File): Report? = try {
             val root = JSONObject(file.readText())
@@ -31,8 +45,23 @@ data class Report(
             val argv = buildList {
                 if (argvArr != null) for (i in 0 until argvArr.length()) add(argvArr.getString(i))
             }
+            val inf = root.optJSONObject("inference")?.let { j ->
+                Inference(
+                    decodeTokS       = j.optDouble("decode_tok_s", 0.0),
+                    prefillTokS      = j.optDouble("prefill_tok_s", 0.0),
+                    ttftS            = j.optDouble("ttft_s", 0.0),
+                    promptTokens     = j.optInt("prompt_tokens", 0),
+                    generated        = j.optInt("generated", 0),
+                    weightsResidentMb= j.optDouble("weights_resident_mb", 0.0),
+                    kvCacheMb        = j.optDouble("kv_cache_mb", 0.0),
+                    streamedMb       = j.optDouble("streamed_mb", 0.0),
+                    contextUsed      = j.optInt("context_used", 0),
+                    contextMax       = j.optInt("context_max", 0),
+                )
+            }
             Report(
                 path = file.absolutePath,
+                schema = root.optString("schema", "prayog.run/1"),
                 startedAt = root.optString("started_at"),
                 experiment = root.optString("experiment", "(unnamed)"),
                 cmd = root.optString("cmd"),
@@ -41,6 +70,7 @@ data class Report(
                 signal = root.optInt("signal", 0),
                 wallSec = metrics.optDouble("wall_sec", 0.0),
                 maxRssMb = metrics.optDouble("maxrss_mb", 0.0),
+                inference = inf,
                 stdoutSample = root.optString("stdout_sample"),
                 stderrSample = root.optString("stderr_sample"),
             )

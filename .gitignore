@@ -12,6 +12,9 @@ android/gradle/wrapper/gradle-wrapper.jar
 # but they're small JSON, so you can commit interesting ones to golden/ if you want.
 reports/
 
+# GGUF weights are huge and user-fetched; never commit them.
+models/
+
 # IDE
 .idea/
 *.iml
