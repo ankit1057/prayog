@@ -1,0 +1,21 @@
+# build outputs
+engine/build/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/gradle/wrapper/gradle-wrapper.jar
+*.o
+*.obj
+
+# reports are experiment artefacts, not source — keep them local by default,
+# but they're small JSON, so you can commit interesting ones to golden/ if you want.
+reports/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store

@@ -1,0 +1,15 @@
+# 001 — sipllm cold-start baseline.
+#
+# What: measure how long the sipllm llm-engine binary takes to start and exit
+#       when asked only to print its help text. This is the "process + libc +
+#       static init" floor — any real inference run is bounded below by this.
+#
+# How to interpret: the wall_sec here is the cold-start overhead you pay on
+#       every invocation before a single token of inference is produced. If
+#       this is 150ms, no matter how good the engine is, a batched invocation
+#       of 10 one-liners pays 1.5s of overhead. Important for interactive UX.
+
+name = "sipllm-coldstart"
+description = "llm-engine process start + help print, no model, no inference"
+cmd  = "/data/data/com.termux/files/home/.sipllm/bin/llm-engine"
+args = "--help"

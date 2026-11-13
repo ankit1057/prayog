@@ -1,0 +1,11 @@
+# 002 — bash cold-start baseline.
+#
+# What: measure how long bash takes to start and exit with a trivial command.
+# Why:  comparison floor for 001. Any native binary that beats bash is
+#       "good enough" for CLI UX; anything worse tells you static init or
+#       first-touch pages are expensive.
+
+name = "sh-coldstart"
+description = "bash process start + echo, no I/O"
+cmd  = "/data/data/com.termux/files/usr/bin/bash"
+args = "-c true"
