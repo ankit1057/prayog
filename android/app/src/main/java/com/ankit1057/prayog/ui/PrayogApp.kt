@@ -12,6 +12,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.ankit1057.prayog.Agree
+import com.ankit1057.prayog.AgreeQuant
 import com.ankit1057.prayog.Entry
 import com.ankit1057.prayog.Inference
 import com.ankit1057.prayog.Report
@@ -37,6 +39,7 @@ fun PrayogApp() {
         null -> "prayog — experiments"
         is Entry.Run -> s.report.experiment
         is Entry.Of  -> "sweep: ${s.sweep.stem}"
+        is Entry.Ag  -> "agree: ${s.agree.stem}"
     }
 
     Scaffold(
@@ -56,6 +59,7 @@ fun PrayogApp() {
                 loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
                 selected is Entry.Run -> ReportDetail((selected as Entry.Run).report)
                 selected is Entry.Of  -> SweepDetail((selected as Entry.Of).sweep)
+                selected is Entry.Ag  -> AgreeDetail((selected as Entry.Ag).agree)
                 entries.isEmpty()     -> EmptyState()
                 else -> EntryList(entries) { selected = it }
             }
@@ -87,6 +91,7 @@ private fun EntryList(entries: List<Entry>, onPick: (Entry) -> Unit) {
             when (e) {
                 is Entry.Run -> RunCard(e.report) { onPick(e) }
                 is Entry.Of  -> SweepCard(e.sweep) { onPick(e) }
+                is Entry.Ag  -> AgreeCard(e.agree) { onPick(e) }
             }
         }
     }
@@ -95,6 +100,7 @@ private fun EntryList(entries: List<Entry>, onPick: (Entry) -> Unit) {
 private fun keyFor(e: Entry): String = when (e) {
     is Entry.Run -> e.report.path
     is Entry.Of  -> e.sweep.path
+    is Entry.Ag  -> e.agree.path
 }
 
 @Composable
@@ -216,6 +222,104 @@ private fun ReportDetail(r: Report) {
                     style = MaterialTheme.typography.bodySmall)
             }
         }
+    }
+}
+
+@Composable
+private fun AgreeCard(a: Agree, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        onClick = onClick,
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val q = a.quants.joinToString(" vs ") { it.quant }
+                Text("agree: ${a.stem}  ($q)",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f))
+                val ok = a.agreement.byteRate >= 0.5
+                Badge(containerColor = if (ok) MaterialTheme.colorScheme.primary
+                                       else    MaterialTheme.colorScheme.error) {
+                    Text("${"%.0f".format(a.agreement.byteRate * 100)}%",
+                         style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Text(a.startedAt, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(6.dp))
+            FlowChips {
+                Chip("n=${a.n}")
+                Chip("seed=${a.seed}")
+                Chip("${a.agreement.commonChars} chars common")
+                Chip("${a.agreement.commonWords} words common")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AgreeDetail(a: Agree) {
+    val scroll = androidx.compose.foundation.rememberScrollState()
+    Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(scroll)) {
+        val q = a.quants.joinToString(" vs ") { it.quant }
+        Text("agree: ${a.stem}  ($q)",
+            style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(a.startedAt, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(12.dp))
+
+        SectionHeader("config")
+        Metric("prompt",  "\"${a.prompt}\"")
+        Metric("tokens",  a.n.toString())
+        Metric("seed",    a.seed.toString())
+        Metric("threads", a.threads.toString())
+
+        Spacer(Modifier.height(16.dp))
+        SectionHeader("agreement")
+        Metric("bytes",   "${a.agreement.commonBytes} common  (${"%.1f".format(a.agreement.byteRate * 100)}%)")
+        Metric("chars",   "${a.agreement.commonChars} common")
+        Metric("words",   "${a.agreement.commonWords} common  (${"%.1f".format(a.agreement.wordRate * 100)}%)")
+
+        if (a.quants.size == 2) {
+            Spacer(Modifier.height(16.dp))
+            SectionHeader("divergence")
+            val cut = a.agreement.commonBytes
+            DivergenceView(
+                prefix = a.quants[0].generated.substring(0, cut.coerceAtMost(a.quants[0].generated.length)),
+                a = a.quants[0],
+                b = a.quants[1],
+                cut = cut,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DivergenceView(prefix: String, a: AgreeQuant, b: AgreeQuant, cut: Int) {
+    Column {
+        Text("common prefix:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+        Text(prefix.ifEmpty { "(none — divergence from first token)" },
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(10.dp))
+        QuantTail(label = a.quant, generated = a.generated, cut = cut,
+                  tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(8.dp))
+        QuantTail(label = b.quant, generated = b.generated, cut = cut,
+                  tint = MaterialTheme.colorScheme.secondary)
+    }
+}
+
+@Composable
+private fun QuantTail(label: String, generated: String, cut: Int, tint: androidx.compose.ui.graphics.Color) {
+    val tail = if (cut < generated.length) generated.substring(cut) else ""
+    Column {
+        Text(label,
+            style = MaterialTheme.typography.labelLarge,
+            color = tint)
+        Text(tail.ifEmpty { "(agreed through end)" },
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall)
     }
 }
 

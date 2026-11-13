@@ -35,6 +35,78 @@ data class SweepRow(
     val inference: Inference,
 )
 
+data class AgreeQuant(
+    val quant: String,
+    val modelPath: String,
+    val generated: String,
+    val runReportPath: String,
+    val wallSec: Double,
+    val decodeTokS: Double,
+)
+
+data class Agreement(
+    val commonBytes: Int,
+    val commonChars: Int,
+    val commonWords: Int,
+    val byteRate: Double,
+    val wordRate: Double,
+)
+
+data class Agree(
+    val path: String,
+    val startedAt: String,
+    val stem: String,
+    val prompt: String,
+    val n: Int,
+    val seed: Int,
+    val threads: Int,
+    val engine: String,
+    val agreement: Agreement,
+    val quants: List<AgreeQuant>,
+) {
+    companion object {
+        fun parse(file: File): Agree? = try {
+            val root = JSONObject(file.readText())
+            if (!root.optString("schema").startsWith("prayog.agree/")) return null
+            val agg = root.optJSONObject("agreement") ?: return null
+            val quantsArr = root.optJSONArray("quants") ?: return null
+            val qs = buildList {
+                for (i in 0 until quantsArr.length()) {
+                    val q = quantsArr.getJSONObject(i)
+                    add(AgreeQuant(
+                        quant        = q.optString("quant"),
+                        modelPath    = q.optString("model"),
+                        generated    = q.optString("generated"),
+                        runReportPath= q.optString("run_report"),
+                        wallSec      = q.optDouble("wall_sec", 0.0),
+                        decodeTokS   = q.optDouble("decode_tok_s", 0.0),
+                    ))
+                }
+            }
+            Agree(
+                path = file.absolutePath,
+                startedAt = root.optString("started_at"),
+                stem   = root.optString("stem"),
+                prompt = root.optString("prompt"),
+                n = root.optInt("n", 0),
+                seed = root.optInt("seed", 0),
+                threads = root.optInt("threads", 0),
+                engine = root.optString("engine"),
+                agreement = Agreement(
+                    commonBytes = agg.optInt("common_bytes", 0),
+                    commonChars = agg.optInt("common_chars", 0),
+                    commonWords = agg.optInt("common_words", 0),
+                    byteRate    = agg.optDouble("byte_rate", 0.0),
+                    wordRate    = agg.optDouble("word_rate", 0.0),
+                ),
+                quants = qs,
+            )
+        } catch (t: Throwable) {
+            null
+        }
+    }
+}
+
 data class Sweep(
     val path: String,
     val startedAt: String,
@@ -163,6 +235,7 @@ sealed interface Entry {
     val startedAt: String
     data class Run(val report: Report) : Entry { override val startedAt get() = report.startedAt }
     data class Of(val sweep: Sweep)    : Entry { override val startedAt get() = sweep.startedAt }
+    data class Ag(val agree: Agree)    : Entry { override val startedAt get() = agree.startedAt }
 }
 
 /**
@@ -183,7 +256,8 @@ object ReportStore {
         return dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
             .orEmpty()
             .mapNotNull<File, Entry> { f ->
-                Sweep.parse(f)?.let(Entry::Of)
+                Agree.parse(f)?.let(Entry::Ag)
+                    ?: Sweep.parse(f)?.let(Entry::Of)
                     ?: Report.parse(f)?.let(Entry::Run)
             }
             .sortedByDescending { it.startedAt }

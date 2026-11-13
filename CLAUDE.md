@@ -62,17 +62,22 @@ Clang 21.1.8 for aarch64 Android target. `-O2 -march=armv8-a`. Binary at
   "Run from phone" is a separate future spike (ProcessBuilder + jniLibs
   extraction) — not v1.
 
-## known gaps (as of 0.3.0)
+## known gaps (as of 0.4.0)
 
-- No perplexity eval harness yet. `prayog eval <model> <wikitext.txt>`
-  is the natural next subcommand — needs a tokenizer round-trip and a logit
-  dump path on `llm-engine`.
+- Agreement is a proxy, not perplexity. True PPL needs per-position logits
+  from llm-engine (today it only emits final-position top-K via `dump_logits`,
+  which is Linux-only in the preserved bin). Either build `dump_logits` for
+  Termux + extend it for all-position logit dump, OR wait for a sipllm patch
+  that adds `--dump-logits path`.
 - Sweep preflight fails hard when a model is missing; `prayog sweep --pull`
   (auto-fetch missing quants) is a sensible add.
 - Android app: no run-triggering (termux-exec intents), no history graphing
-  across runs of the same experiment, no cross-sweep diff.
+  across runs of the same experiment, no cross-sweep / cross-agree diff.
 - Download resumability relies on curl's `-C -`. If a partial file is
   corrupt, delete it and retry.
+- Agreement on free-generation prompts converges to low numbers fast
+  (single-token divergence cascades). For meaningful per-quant diffs, use
+  structured prompts where the next-token distribution is near-deterministic.
 
 ## how this file stays honest
 

@@ -35,9 +35,10 @@
 
 namespace prayog {
 
-constexpr const char* kVersion     = "0.3.0";
+constexpr const char* kVersion     = "0.4.0";
 constexpr const char* kSchema      = "prayog.run/2";
 constexpr const char* kSweepSchema = "prayog.sweep/1";
+constexpr const char* kAgreeSchema = "prayog.agree/1";
 
 static std::string trim(std::string_view s);
 
@@ -340,10 +341,19 @@ static std::string trim(std::string_view s) {
 }
 
 static std::vector<std::string> split_args(std::string_view s) {
+    // Mini shell-like tokenizer: whitespace splits; "..." groups; \" and \\
+    // inside a quoted segment produce a literal " / \. An unescaped " toggles
+    // quote state. Bug fixed 0.4.0: earlier versions treated \" as toggle-plus-
+    // literal and left a stray backslash in the prompt.
     std::vector<std::string> out;
     std::string cur;
     bool in_q = false;
-    for (char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_q && c == '\\' && i + 1 < s.size() && (s[i+1] == '"' || s[i+1] == '\\')) {
+            cur.push_back(s[++i]);
+            continue;
+        }
         if (c == '"') { in_q = !in_q; continue; }
         if (!in_q && std::isspace(static_cast<unsigned char>(c))) {
             if (!cur.empty()) { out.push_back(cur); cur.clear(); }
@@ -770,6 +780,217 @@ static int cmd_sweep(int argc, char** argv) {
     return 0;
 }
 
+// --- agree: same prompt + seed through two quants, diff the outputs --------
+// This is a cheap, honest quality proxy that does NOT need a tokenizer or
+// logit access: run both quants with --greedy --seed S, capture generated
+// text, find the common prefix. Where divergence happens (and after how
+// many tokens the quant goes off-rails) is the signal.
+//
+// Not perplexity. But perplexity needs per-position logits, which the
+// current llm-engine doesn't expose. Agreement rate answers the research
+// question an engineer actually asks: "Does this quant change my outputs?"
+
+struct AgreeOut {
+    std::string quant;
+    std::string model_path;
+    std::string generated; // stdout minus the echoed prompt
+    BenchResult bench;
+    std::string run_report_path;
+};
+
+// Count UTF-8 code points in a byte-length slice. Rough — doesn't validate
+// continuation bytes; good enough for divergence reporting.
+static size_t utf8_count(std::string_view s) {
+    size_t n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+static std::vector<std::string> split_ws(std::string_view s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+        } else cur.push_back(c);
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+static int cmd_agree(int argc, char** argv) {
+    // prayog agree [--stem NAME] --quants Q1,Q2 [--prompt "..."] [-n N]
+    //              [--seed S] [--threads T] [--engine PATH]
+    std::string stem    = "tinyllama";
+    std::string quants_csv;
+    std::string prompt  = "The capital of France is";
+    int         n       = 32;
+    int         seed    = 42;
+    int         threads = 4;
+    std::string engine  = (std::getenv("HOME") ? std::string(std::getenv("HOME")) : ".")
+                          + "/.sipllm/bin/llm-engine";
+
+    for (int i = 2; i < argc; ++i) {
+        std::string_view f = argv[i];
+        if      (f == "--stem"    && i + 1 < argc) stem    = argv[++i];
+        else if (f == "--quants"  && i + 1 < argc) quants_csv = argv[++i];
+        else if (f == "--prompt"  && i + 1 < argc) prompt  = argv[++i];
+        else if (f == "-n"        && i + 1 < argc) n       = std::atoi(argv[++i]);
+        else if (f == "--seed"    && i + 1 < argc) seed    = std::atoi(argv[++i]);
+        else if (f == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+        else if (f == "--engine"  && i + 1 < argc) engine  = argv[++i];
+        else { std::fprintf(stderr, "prayog agree: unknown flag %s\n", argv[i]); return 2; }
+    }
+    auto quants = split_csv(quants_csv);
+    if (quants.size() != 2) {
+        std::fprintf(stderr,
+            "prayog agree needs exactly 2 quants (got %zu).\n"
+            "usage: prayog agree --stem NAME --quants Q1,Q2 [--prompt \"...\"] [-n N] [--seed S]\n",
+            quants.size());
+        return 2;
+    }
+
+    std::vector<AgreeOut> outs;
+    outs.reserve(2);
+    for (auto& q : quants) {
+        std::string path = resolve_model_file(stem, q);
+        if (path.empty()) {
+            std::fprintf(stderr,
+                "prayog agree: %s:%s not found. run: prayog pull %s:%s\n",
+                stem.c_str(), q.c_str(), stem.c_str(), q.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "\n[%zu/2] %s:%s\n", outs.size() + 1, stem.c_str(), q.c_str());
+
+        AgreeOut o;
+        o.quant = q;
+        o.model_path = path;
+        std::vector<std::string> cmd = {
+            engine, path,
+            "-p", prompt,
+            "-n", std::to_string(n),
+            "--greedy",
+            "--threads", std::to_string(threads),
+            "--seed", std::to_string(seed),
+        };
+        o.bench = run_and_measure(cmd);
+        o.bench.inference = parse_inference_metrics(o.bench.stderr_full, o.bench.stdout_full);
+        // Strip the echoed prompt. llm-engine prints prompt then generated
+        // tokens on stdout; if the prefix matches, trim it. Otherwise keep
+        // the whole output (model may have tokenised oddly).
+        o.generated = o.bench.stdout_full;
+        if (o.generated.rfind(prompt, 0) == 0) o.generated = o.generated.substr(prompt.size());
+
+        std::string tag = "agree-" + stem + "-" + q;
+        std::string json = serialize(o.bench, tag);
+        o.run_report_path = next_report_path(tag);
+        std::ofstream f(o.run_report_path);
+        f << json;
+
+        std::fprintf(stderr, "      wall=%.3fs maxrss=%.1fMB exit=%d\n",
+                     o.bench.wall_sec, o.bench.maxrss_kb / 1024.0, o.bench.exit_code);
+        print_inference_summary(o.bench.inference);
+        outs.push_back(std::move(o));
+    }
+
+    const auto& a = outs[0].generated;
+    const auto& b = outs[1].generated;
+
+    size_t common_bytes = 0;
+    while (common_bytes < a.size() && common_bytes < b.size() && a[common_bytes] == b[common_bytes])
+        ++common_bytes;
+    // Don't split a code point: back off to the start of the character.
+    while (common_bytes > 0 && (static_cast<unsigned char>(a[common_bytes]) & 0xC0) == 0x80)
+        --common_bytes;
+
+    size_t common_chars = utf8_count(a.substr(0, common_bytes));
+    auto wa = split_ws(a);
+    auto wb = split_ws(b);
+    size_t common_words = 0;
+    while (common_words < wa.size() && common_words < wb.size() && wa[common_words] == wb[common_words])
+        ++common_words;
+
+    double char_rate = (a.empty() && b.empty()) ? 1.0
+                      : double(common_bytes) / std::max(a.size(), b.size());
+    double word_rate = (wa.empty() && wb.empty()) ? 1.0
+                      : double(common_words) / std::max(wa.size(), wb.size());
+
+    // Emit summary JSON.
+    auto t = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char ts[64];
+    std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
+    std::string summary_path = reports_dir() + "/" + ts + "-agree-" + stem + ".json";
+    {
+        std::ofstream f(summary_path);
+        f << "{\n";
+        f << "  \"schema\": \"" << kAgreeSchema << "\",\n";
+        f << "  \"started_at\": \"" << iso8601_now() << "\",\n";
+        f << "  \"stem\": \""    << json_escape(stem)   << "\",\n";
+        f << "  \"prompt\": \""  << json_escape(prompt) << "\",\n";
+        f << "  \"n\": "         << n        << ",\n";
+        f << "  \"seed\": "      << seed     << ",\n";
+        f << "  \"threads\": "   << threads  << ",\n";
+        f << "  \"engine\": \""  << json_escape(engine)  << "\",\n";
+        f << "  \"agreement\": {\n";
+        f << "    \"common_bytes\": " << common_bytes << ",\n";
+        f << "    \"common_chars\": " << common_chars << ",\n";
+        f << "    \"common_words\": " << common_words << ",\n";
+        f << "    \"byte_rate\": "    << char_rate    << ",\n";
+        f << "    \"word_rate\": "    << word_rate    << "\n";
+        f << "  },\n";
+        f << "  \"quants\": [\n";
+        for (size_t i = 0; i < 2; ++i) {
+            const auto& o = outs[i];
+            f << "    {\n";
+            f << "      \"quant\": \""     << json_escape(o.quant)       << "\",\n";
+            f << "      \"model\": \""     << json_escape(o.model_path)  << "\",\n";
+            f << "      \"generated\": \"" << json_escape(o.generated)   << "\",\n";
+            f << "      \"run_report\": \""<< json_escape(o.run_report_path) << "\",\n";
+            f << "      \"wall_sec\": "    << o.bench.wall_sec           << ",\n";
+            f << "      \"decode_tok_s\": "<< o.bench.inference.decode_tok_s << "\n";
+            f << "    }" << (i == 0 ? "," : "") << "\n";
+        }
+        f << "  ]\n";
+        f << "}\n";
+    }
+
+    // Pretty markdown on stdout.
+    std::printf("\n# agree: %s  (n=%d, seed=%d, threads=%d)\n\n", stem.c_str(), n, seed, threads);
+    std::printf("prompt: `%s`\n\n", prompt.c_str());
+    std::printf("| quant      | decode tok/s | wall s | generated |\n");
+    std::printf("|------------|--------------|--------|-----------|\n");
+    for (auto& o : outs) {
+        std::string g = o.generated;
+        if (g.size() > 60) g = g.substr(0, 57) + "...";
+        for (char& c : g) if (c == '\n' || c == '|') c = ' ';
+        std::printf("| %-10s | %12.2f | %6.2f | %s |\n",
+                    o.quant.c_str(), o.bench.inference.decode_tok_s,
+                    o.bench.wall_sec, g.c_str());
+    }
+    std::printf("\n**agreement:** %.1f%% of chars (%zu / %zu), %.1f%% of words (%zu / %zu)\n",
+                char_rate * 100.0, common_chars,
+                std::max(utf8_count(a), utf8_count(b)),
+                word_rate * 100.0, common_words,
+                std::max(wa.size(), wb.size()));
+    if (common_bytes < std::min(a.size(), b.size())) {
+        std::string prefix = a.substr(0, common_bytes);
+        std::string tail_a = a.substr(common_bytes, 40);
+        std::string tail_b = b.substr(common_bytes, 40);
+        for (std::string* s : {&prefix, &tail_a, &tail_b})
+            for (char& c : *s) if (c == '\n') c = ' ';
+        std::printf("\n**divergence at char %zu**:\n", common_chars);
+        std::printf("  common: ...%.40s\n", prefix.size() > 40 ? prefix.substr(prefix.size() - 40).c_str() : prefix.c_str());
+        std::printf("  %-10s: %s...\n", outs[0].quant.c_str(), tail_a.c_str());
+        std::printf("  %-10s: %s...\n", outs[1].quant.c_str(), tail_b.c_str());
+    } else {
+        std::printf("\n**no divergence** — outputs agree over %zu bytes.\n", common_bytes);
+    }
+    std::fprintf(stderr, "\nprayog: wrote %s\n", summary_path.c_str());
+    return 0;
+}
+
 static int cmd_models(int /*argc*/, char** /*argv*/) {
     std::string dir = models_dir();
     DIR* d = opendir(dir.c_str());
@@ -850,6 +1071,7 @@ static int usage() {
         "  prayog bench [--experiment NAME] [--inference] <cmd> [args...]\n"
         "  prayog run     <experiment.toml>\n"
         "  prayog sweep   [--stem NAME] --quants Q1,Q2,... [--prompt \"...\"] [-n N]\n"
+        "  prayog agree   [--stem NAME] --quants Q1,Q2 [--prompt \"...\"] [-n N] [--seed S]\n"
         "  prayog pull    <name|url> [--as filename]\n"
         "  prayog models\n"
         "  prayog compare <a.json> <b.json>\n"
@@ -869,6 +1091,7 @@ int main(int argc, char** argv) {
     if (sub == "bench")   return prayog::cmd_bench(argc, argv);
     if (sub == "run")     return prayog::cmd_run(argc, argv);
     if (sub == "sweep")   return prayog::cmd_sweep(argc, argv);
+    if (sub == "agree")   return prayog::cmd_agree(argc, argv);
     if (sub == "pull")    return prayog::cmd_pull(argc, argv);
     if (sub == "models")  return prayog::cmd_models(argc, argv);
     if (sub == "compare") return prayog::cmd_compare(argc, argv);

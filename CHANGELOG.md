@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.4.0 — 2026-11-13
+
+**Quality signal: agreement rate.**
+
+The lab measured speed, memory, and TTFT; it didn't measure quality. Full
+perplexity needs per-position logits (which llm-engine doesn't expose), so
+0.4.0 adds a cheaper but honest proxy: run the same prompt + seed through two
+quants with greedy sampling and diff the generated text. The common-prefix
+length and the divergence point answer the research question an engineer
+actually asks — *"does this quant change my outputs?"* — without a tokenizer.
+
+### engine
+- New `prayog agree [--stem NAME] --quants Q1,Q2 [--prompt "..."] [-n N]
+  [--seed S] [--threads T] [--engine PATH]` subcommand.
+- Schema `prayog.agree/1` with `agreement { common_bytes, common_chars,
+  common_words, byte_rate, word_rate }` + per-quant generated text, run
+  reports, and inference metrics.
+- Prints a markdown divergence report to stdout (common prefix shown, then
+  each quant's tail after the divergence point).
+- UTF-8-safe common-prefix: won't split a multi-byte code point.
+- **Fix** (long-standing): TOML `args = "...  -p \"foo\"..."` now parses
+  `\"` and `\\` correctly inside quoted strings. Before 0.4.0, prayog's
+  TOML-lite loader passed literal backslashes into argv, corrupting prompts
+  in experiment files. Experiments 001/002 weren't affected (their
+  args don't use escapes); 003 was.
+
+### reference measurement (Termux aarch64, this device, 2026-11-13)
+TinyLlama 1.1B greedy 32 tok, seed 42, "The capital of France is":
+
+| quant  | decode tok/s | wall s | generated (first chars after prompt) |
+|--------|--------------|--------|--------------------------------------|
+| q4_k_m | 4.90         | 7.93   | ` Paris.\n\n2. B.C. The capital of ancient Rome was Rome...` |
+| q8_0   | 2.04         | 21.47  | ` Paris.\n\n2. B. C. The capital of Canada is Ottawa...` |
+
+**Agreement: 14.7% of chars (14 / 95), 10.5% of words (2 / 19).**
+Divergence at char 14: both say "Paris.\n\n2. B.", then Q4 goes "C. ancient
+Rome" and Q8 goes " C. Canada is Ottawa". Low agreement on free-generation
+is expected — single-token divergence cascades. For meaningful numbers,
+run agree over structured prompts where the next token is near-deterministic.
+
+### android
+- `Agree`, `AgreeQuant`, `Agreement` data classes mirror `prayog.agree/1`.
+- `Entry.Ag` variant intermixed into the list, sorted by `started_at`.
+- Agree card shows the % agreement as a colour-coded badge (green ≥50%, red <50%),
+  plus chips for `n`, `seed`, and common counts.
+- Agree detail: config + agreement sections + a three-pane divergence view
+  showing the common prefix, then each quant's tail after the divergence
+  point in its own colour.
+
 ## 0.3.0 — 2026-11-13
 
 **Quant sweeps.**
