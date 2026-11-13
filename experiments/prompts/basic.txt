@@ -1,0 +1,33 @@
+# basic prompt corpus — mixed completion styles.
+#
+# One prompt per line. Blank lines and lines starting with # are skipped.
+# Keep each prompt short (<80 chars) so a 16-32 token generation is enough
+# to see where the quants diverge.
+#
+# Mix categories on purpose: factual next-tokens are near-deterministic
+# (good agreement), free-form completions diverge fast (bad agreement).
+# Both signals are useful — stable prompts tell you the quant is *working*,
+# divergent prompts tell you how fast it drifts.
+
+# --- factual continuations (should agree) --------------------------------
+The capital of France is
+The chemical symbol for gold is
+Water boils at
+The speed of light is approximately
+Mount Everest is located in
+
+# --- code completion (should mostly agree on syntax) ---------------------
+def factorial(n):
+import numpy as np
+SELECT * FROM users WHERE
+function add(a, b) {
+
+# --- structured data (JSON, markdown) ------------------------------------
+Here is a JSON object: {"name":
+# markdown header
+In the morning I like to drink
+
+# --- open-ended (will diverge) -------------------------------------------
+Once upon a time
+The weather today is
+A good software engineer

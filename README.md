@@ -69,6 +69,7 @@ at a sideloaded SDK) but slow — the walking skeleton assumes a workstation bui
 | `prayog run EXP.toml`      | run a declared experiment (auto-scrapes if cmd is llm-engine) |
 | `prayog sweep --stem NAME --quants Q1,Q2,... [--prompt "..."] [-n N] [--threads T]` | run one prompt across a quant matrix |
 | `prayog agree --stem NAME --quants Q1,Q2 [--prompt "..."] [-n N] [--seed S] [--threads T]` | same prompt+seed through two quants, report text agreement |
+| `prayog agree-batch --stem NAME --quants Q1,Q2 --prompts FILE [-n N] [--seed S] [--threads T]` | run agree over a prompt corpus, aggregate stats |
 | `prayog pull NAME\|URL [--as FILE]` | download a GGUF to `$PRAYOG_HOME/models/` |
 | `prayog models`            | list downloaded models with sizes |
 | `prayog compare A.json B.json` | side-by-side metric diff |

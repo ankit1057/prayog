@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.5.0 — 2026-11-13
+
+**Batch agreement over a prompt corpus.**
+
+Single-prompt agreement is noisy — one lucky (or unlucky) next-token
+decides the whole run. Averaging across a mix of prompt styles (factual,
+code, structured, open-ended) collapses per-quant quality into a single
+number you can trend over time. Bimodal distributions are the typical
+result: code/structured prompts agree at 100%, open-ended at <10%, with
+little in between.
+
+### engine
+- New `prayog agree-batch [--stem NAME] --quants Q1,Q2 --prompts FILE
+  [-n N] [--seed S] [--threads T] [--engine PATH]` subcommand.
+- Schema `prayog.agree-batch/1` with `stats { count, perfect_count,
+  mean/median/p10/p90/min/max_byte_rate, mean_word_rate }` plus `rows[]`
+  of per-prompt `{prompt, common_bytes/chars/words, len_a/b, byte_rate,
+  word_rate, wall_a/b, snippet_a/b}`.
+- Prompt file format: one per line, `#` for comments, blank lines skipped.
+- Prints a markdown per-prompt table + summary stats.
+
+### corpus
+- New `experiments/prompts/basic.txt` — 15 mixed prompts
+  (factual / code / structured / open-ended).
+
+### reference measurement (Termux aarch64, this device, 2026-11-13)
+TinyLlama 1.1B q4_k_m vs q8_0, greedy, seed 42, n=24, basic.txt (14 prompts):
+
+| category                 | byte rate |
+|--------------------------|-----------|
+| `def factorial(n):`      |  100% |
+| `function add(a, b) {`   |  100% |
+| `Here is a JSON object:` |  100% |
+| `The speed of light is`  |  66%  |
+| `SELECT * FROM users`    |  62%  |
+| `Once upon a time`       |  38%  |
+| `The capital of France`  |  23%  |
+| `In the morning I like`  |  11%  |
+| `The chemical symbol`    |  6%   |
+| rest                     |  1-2% |
+
+**Summary:** mean 36.5%, median 10.5%, p10 1.0%, p90 100%, perfect 3/14.
+
+The bimodal shape is the finding: code and structured prompts survive
+quantisation cleanly; free-form / factual prompts cascade divergence from
+one wrong next-token. For meaningful quality signals across quants, test
+with structured prompts.
+
+### android
+- `AgreeBatch`, `BatchRow`, `BatchStats` data classes.
+- `Entry.Batch` variant intermixed in the list.
+- Batch card: shows mean / median / perfect-count / `n` chips.
+- Batch detail: config + distribution stats + hand-drawn histogram
+  (10 buckets of 10%) + per-prompt list with colour-coded % badges and
+  divergence snippets.
+
 ## 0.4.0 — 2026-11-13
 
 **Quality signal: agreement rate.**

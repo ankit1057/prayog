@@ -62,7 +62,7 @@ Clang 21.1.8 for aarch64 Android target. `-O2 -march=armv8-a`. Binary at
   "Run from phone" is a separate future spike (ProcessBuilder + jniLibs
   extraction) — not v1.
 
-## known gaps (as of 0.4.0)
+## known gaps (as of 0.5.0)
 
 - Agreement is a proxy, not perplexity. True PPL needs per-position logits
   from llm-engine (today it only emits final-position top-K via `dump_logits`,

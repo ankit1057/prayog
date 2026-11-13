@@ -35,10 +35,11 @@
 
 namespace prayog {
 
-constexpr const char* kVersion     = "0.4.0";
-constexpr const char* kSchema      = "prayog.run/2";
-constexpr const char* kSweepSchema = "prayog.sweep/1";
-constexpr const char* kAgreeSchema = "prayog.agree/1";
+constexpr const char* kVersion          = "0.5.0";
+constexpr const char* kSchema           = "prayog.run/2";
+constexpr const char* kSweepSchema      = "prayog.sweep/1";
+constexpr const char* kAgreeSchema      = "prayog.agree/1";
+constexpr const char* kAgreeBatchSchema = "prayog.agree-batch/1";
 
 static std::string trim(std::string_view s);
 
@@ -991,6 +992,267 @@ static int cmd_agree(int argc, char** argv) {
     return 0;
 }
 
+// --- agree-batch: agreement rate over a corpus of prompts ------------------
+// Single-prompt agreement is noisy — one lucky (or unlucky) next-token
+// decides the whole run. Averaging across a mix of prompt styles (factual,
+// code, open-ended) collapses the per-quant quality into a single number
+// you can trend over time. Prints a per-prompt table + summary stats.
+
+struct BatchRow {
+    std::string prompt;
+    size_t common_bytes = 0;
+    size_t common_chars = 0;
+    size_t common_words = 0;
+    size_t len_a = 0;      // byte length of generated text for quant A
+    size_t len_b = 0;
+    size_t words_a = 0;
+    size_t words_b = 0;
+    double byte_rate = 0.0;
+    double word_rate = 0.0;
+    std::string snippet_a; // first 40 bytes after the divergence point
+    std::string snippet_b;
+    int exit_a = 0, exit_b = 0;
+    double wall_a = 0, wall_b = 0;
+};
+
+static std::vector<std::string> read_prompts(const std::string& path) {
+    std::vector<std::string> out;
+    std::ifstream in(path);
+    if (!in) return out;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string t = trim(line);
+        if (t.empty() || t[0] == '#') continue;
+        out.push_back(t);
+    }
+    return out;
+}
+
+static int cmd_agree_batch(int argc, char** argv) {
+    // prayog agree-batch [--stem NAME] --quants Q1,Q2 --prompts FILE
+    //                    [-n N] [--seed S] [--threads T] [--engine PATH]
+    std::string stem    = "tinyllama";
+    std::string quants_csv;
+    std::string prompts_path;
+    int         n       = 24;
+    int         seed    = 42;
+    int         threads = 4;
+    std::string engine  = (std::getenv("HOME") ? std::string(std::getenv("HOME")) : ".")
+                          + "/.sipllm/bin/llm-engine";
+
+    for (int i = 2; i < argc; ++i) {
+        std::string_view f = argv[i];
+        if      (f == "--stem"    && i + 1 < argc) stem        = argv[++i];
+        else if (f == "--quants"  && i + 1 < argc) quants_csv  = argv[++i];
+        else if (f == "--prompts" && i + 1 < argc) prompts_path= argv[++i];
+        else if (f == "-n"        && i + 1 < argc) n           = std::atoi(argv[++i]);
+        else if (f == "--seed"    && i + 1 < argc) seed        = std::atoi(argv[++i]);
+        else if (f == "--threads" && i + 1 < argc) threads     = std::atoi(argv[++i]);
+        else if (f == "--engine"  && i + 1 < argc) engine      = argv[++i];
+        else { std::fprintf(stderr, "prayog agree-batch: unknown flag %s\n", argv[i]); return 2; }
+    }
+    auto quants = split_csv(quants_csv);
+    if (quants.size() != 2) {
+        std::fprintf(stderr,
+            "prayog agree-batch needs exactly 2 quants (got %zu).\n"
+            "usage: prayog agree-batch --stem X --quants Q1,Q2 --prompts FILE [-n N] [--seed S]\n",
+            quants.size());
+        return 2;
+    }
+    if (prompts_path.empty()) {
+        std::fprintf(stderr, "prayog agree-batch: --prompts FILE is required\n");
+        return 2;
+    }
+    auto prompts = read_prompts(prompts_path);
+    if (prompts.empty()) {
+        std::fprintf(stderr, "prayog agree-batch: no prompts in %s (or file missing)\n", prompts_path.c_str());
+        return 2;
+    }
+
+    // Resolve both quants once.
+    std::string path_a = resolve_model_file(stem, quants[0]);
+    std::string path_b = resolve_model_file(stem, quants[1]);
+    if (path_a.empty() || path_b.empty()) {
+        std::fprintf(stderr, "prayog agree-batch: one of the quants isn't pulled. Run `prayog pull %s:%s` and `prayog pull %s:%s`\n",
+                     stem.c_str(), quants[0].c_str(), stem.c_str(), quants[1].c_str());
+        return 1;
+    }
+
+    std::fprintf(stderr,
+        "prayog agree-batch: stem=%s a=%s b=%s n=%d seed=%d threads=%d prompts=%zu\n",
+        stem.c_str(), quants[0].c_str(), quants[1].c_str(),
+        n, seed, threads, prompts.size());
+
+    std::vector<BatchRow> rows;
+    rows.reserve(prompts.size());
+
+    auto run_one = [&](const std::string& model_path, const std::string& prompt) {
+        std::vector<std::string> cmd = {
+            engine, model_path,
+            "-p", prompt,
+            "-n", std::to_string(n),
+            "--greedy",
+            "--threads", std::to_string(threads),
+            "--seed", std::to_string(seed),
+        };
+        return run_and_measure(cmd);
+    };
+
+    for (size_t pi = 0; pi < prompts.size(); ++pi) {
+        const auto& p = prompts[pi];
+        std::fprintf(stderr, "\n[%zu/%zu] %.50s%s\n", pi + 1, prompts.size(),
+                     p.c_str(), p.size() > 50 ? "..." : "");
+
+        BatchRow r;
+        r.prompt = p;
+
+        auto ba = run_one(path_a, p);
+        auto bb = run_one(path_b, p);
+        r.exit_a = ba.exit_code; r.exit_b = bb.exit_code;
+        r.wall_a = ba.wall_sec;  r.wall_b = bb.wall_sec;
+
+        std::string gen_a = ba.stdout_full;
+        std::string gen_b = bb.stdout_full;
+        if (gen_a.rfind(p, 0) == 0) gen_a = gen_a.substr(p.size());
+        if (gen_b.rfind(p, 0) == 0) gen_b = gen_b.substr(p.size());
+        r.len_a = gen_a.size(); r.len_b = gen_b.size();
+
+        size_t cb = 0;
+        while (cb < gen_a.size() && cb < gen_b.size() && gen_a[cb] == gen_b[cb]) ++cb;
+        while (cb > 0 && (static_cast<unsigned char>(gen_a[cb]) & 0xC0) == 0x80) --cb;
+        r.common_bytes = cb;
+        r.common_chars = utf8_count(gen_a.substr(0, cb));
+
+        auto wa = split_ws(gen_a);
+        auto wb = split_ws(gen_b);
+        r.words_a = wa.size(); r.words_b = wb.size();
+        size_t cw = 0;
+        while (cw < wa.size() && cw < wb.size() && wa[cw] == wb[cw]) ++cw;
+        r.common_words = cw;
+
+        r.byte_rate = (gen_a.empty() && gen_b.empty()) ? 1.0 : double(cb) / std::max(gen_a.size(), gen_b.size());
+        r.word_rate = (wa.empty() && wb.empty())       ? 1.0 : double(cw) / std::max(wa.size(), wb.size());
+
+        auto snip = [](const std::string& s, size_t off) {
+            std::string t = s.substr(std::min(off, s.size()), 40);
+            for (char& c : t) if (c == '\n' || c == '\r') c = ' ';
+            return t;
+        };
+        r.snippet_a = snip(gen_a, cb);
+        r.snippet_b = snip(gen_b, cb);
+
+        std::fprintf(stderr, "    byte_rate=%.2f  common=%zu/%zu  wall=%.2f/%.2fs\n",
+                     r.byte_rate, r.common_bytes,
+                     std::max(gen_a.size(), gen_b.size()),
+                     r.wall_a, r.wall_b);
+        rows.push_back(std::move(r));
+    }
+
+    // Aggregate.
+    std::vector<double> byte_rates, word_rates;
+    double sum_br = 0, sum_wr = 0;
+    size_t perfect = 0;
+    for (auto& r : rows) {
+        byte_rates.push_back(r.byte_rate);
+        word_rates.push_back(r.word_rate);
+        sum_br += r.byte_rate;
+        sum_wr += r.word_rate;
+        if (r.byte_rate >= 0.999) ++perfect;
+    }
+    double mean_br = rows.empty() ? 0.0 : sum_br / rows.size();
+    double mean_wr = rows.empty() ? 0.0 : sum_wr / rows.size();
+    std::sort(byte_rates.begin(), byte_rates.end());
+    std::sort(word_rates.begin(), word_rates.end());
+    auto pct = [](const std::vector<double>& v, double p) {
+        if (v.empty()) return 0.0;
+        size_t i = std::min<size_t>(v.size() - 1, size_t(p * (v.size() - 1)));
+        return v[i];
+    };
+    double min_br = byte_rates.empty() ? 0 : byte_rates.front();
+    double max_br = byte_rates.empty() ? 0 : byte_rates.back();
+    double med_br = pct(byte_rates, 0.5);
+    double p10_br = pct(byte_rates, 0.1);
+    double p90_br = pct(byte_rates, 0.9);
+
+    // Emit summary JSON.
+    auto t = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char ts[64];
+    std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
+    std::string summary_path = reports_dir() + "/" + ts + "-agree-batch-" + stem + ".json";
+    {
+        std::ofstream f(summary_path);
+        f << "{\n";
+        f << "  \"schema\": \"" << kAgreeBatchSchema << "\",\n";
+        f << "  \"started_at\": \"" << iso8601_now() << "\",\n";
+        f << "  \"stem\": \""    << json_escape(stem)      << "\",\n";
+        f << "  \"quant_a\": \"" << json_escape(quants[0]) << "\",\n";
+        f << "  \"quant_b\": \"" << json_escape(quants[1]) << "\",\n";
+        f << "  \"prompts_path\": \"" << json_escape(prompts_path) << "\",\n";
+        f << "  \"n\": "       << n       << ",\n";
+        f << "  \"seed\": "    << seed    << ",\n";
+        f << "  \"threads\": " << threads << ",\n";
+        f << "  \"engine\": \"" << json_escape(engine) << "\",\n";
+        f << "  \"stats\": {\n";
+        f << "    \"count\": "          << rows.size() << ",\n";
+        f << "    \"perfect_count\": "  << perfect     << ",\n";
+        f << "    \"mean_byte_rate\": " << mean_br     << ",\n";
+        f << "    \"mean_word_rate\": " << mean_wr     << ",\n";
+        f << "    \"median_byte_rate\": " << med_br    << ",\n";
+        f << "    \"p10_byte_rate\": "  << p10_br      << ",\n";
+        f << "    \"p90_byte_rate\": "  << p90_br      << ",\n";
+        f << "    \"min_byte_rate\": "  << min_br      << ",\n";
+        f << "    \"max_byte_rate\": "  << max_br      << "\n";
+        f << "  },\n";
+        f << "  \"rows\": [\n";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            f << "    {\n";
+            f << "      \"prompt\": \""      << json_escape(r.prompt)      << "\",\n";
+            f << "      \"common_bytes\": "  << r.common_bytes << ",\n";
+            f << "      \"common_chars\": "  << r.common_chars << ",\n";
+            f << "      \"common_words\": "  << r.common_words << ",\n";
+            f << "      \"len_a\": "         << r.len_a        << ",\n";
+            f << "      \"len_b\": "         << r.len_b        << ",\n";
+            f << "      \"words_a\": "       << r.words_a      << ",\n";
+            f << "      \"words_b\": "       << r.words_b      << ",\n";
+            f << "      \"byte_rate\": "     << r.byte_rate    << ",\n";
+            f << "      \"word_rate\": "     << r.word_rate    << ",\n";
+            f << "      \"wall_a\": "        << r.wall_a       << ",\n";
+            f << "      \"wall_b\": "        << r.wall_b       << ",\n";
+            f << "      \"exit_a\": "        << r.exit_a       << ",\n";
+            f << "      \"exit_b\": "        << r.exit_b       << ",\n";
+            f << "      \"snippet_a\": \""   << json_escape(r.snippet_a) << "\",\n";
+            f << "      \"snippet_b\": \""   << json_escape(r.snippet_b) << "\"\n";
+            f << "    }" << (i + 1 < rows.size() ? "," : "") << "\n";
+        }
+        f << "  ]\n";
+        f << "}\n";
+    }
+
+    // Markdown summary.
+    std::printf("\n# agree-batch: %s  (%s vs %s, n=%d, seed=%d)\n\n",
+                stem.c_str(), quants[0].c_str(), quants[1].c_str(), n, seed);
+    std::printf("| prompt                                      | byte rate | words | wall a/b (s) |\n");
+    std::printf("|---------------------------------------------|-----------|-------|--------------|\n");
+    for (auto& r : rows) {
+        std::string p = r.prompt;
+        if (p.size() > 43) p = p.substr(0, 40) + "...";
+        for (char& c : p) if (c == '|' || c == '\n') c = ' ';
+        std::printf("| %-43s | %8.1f%% | %2zu/%-2zu | %4.1f / %4.1f  |\n",
+                    p.c_str(), r.byte_rate * 100.0,
+                    r.common_words, std::max(r.words_a, r.words_b),
+                    r.wall_a, r.wall_b);
+    }
+    std::printf("\n**summary (%zu prompts):** mean byte_rate %.1f%%  median %.1f%%  p10 %.1f%%  p90 %.1f%%  perfect %zu/%zu\n",
+                rows.size(),
+                mean_br * 100.0, med_br * 100.0, p10_br * 100.0, p90_br * 100.0,
+                perfect, rows.size());
+    std::fprintf(stderr, "\nprayog: wrote %s\n", summary_path.c_str());
+    return 0;
+}
+
 static int cmd_models(int /*argc*/, char** /*argv*/) {
     std::string dir = models_dir();
     DIR* d = opendir(dir.c_str());
@@ -1072,6 +1334,7 @@ static int usage() {
         "  prayog run     <experiment.toml>\n"
         "  prayog sweep   [--stem NAME] --quants Q1,Q2,... [--prompt \"...\"] [-n N]\n"
         "  prayog agree   [--stem NAME] --quants Q1,Q2 [--prompt \"...\"] [-n N] [--seed S]\n"
+        "  prayog agree-batch [--stem NAME] --quants Q1,Q2 --prompts FILE [-n N] [--seed S]\n"
         "  prayog pull    <name|url> [--as filename]\n"
         "  prayog models\n"
         "  prayog compare <a.json> <b.json>\n"
@@ -1091,8 +1354,9 @@ int main(int argc, char** argv) {
     if (sub == "bench")   return prayog::cmd_bench(argc, argv);
     if (sub == "run")     return prayog::cmd_run(argc, argv);
     if (sub == "sweep")   return prayog::cmd_sweep(argc, argv);
-    if (sub == "agree")   return prayog::cmd_agree(argc, argv);
-    if (sub == "pull")    return prayog::cmd_pull(argc, argv);
+    if (sub == "agree")       return prayog::cmd_agree(argc, argv);
+    if (sub == "agree-batch") return prayog::cmd_agree_batch(argc, argv);
+    if (sub == "pull")        return prayog::cmd_pull(argc, argv);
     if (sub == "models")  return prayog::cmd_models(argc, argv);
     if (sub == "compare") return prayog::cmd_compare(argc, argv);
     if (sub == "report")  return prayog::cmd_report(argc, argv);

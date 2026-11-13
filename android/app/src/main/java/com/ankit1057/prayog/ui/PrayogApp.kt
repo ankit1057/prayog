@@ -1,5 +1,6 @@
 package com.ankit1057.prayog.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -13,7 +14,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.ankit1057.prayog.Agree
+import com.ankit1057.prayog.AgreeBatch
 import com.ankit1057.prayog.AgreeQuant
+import com.ankit1057.prayog.BatchRow
 import com.ankit1057.prayog.Entry
 import com.ankit1057.prayog.Inference
 import com.ankit1057.prayog.Report
@@ -37,9 +40,10 @@ fun PrayogApp() {
 
     val title = when (val s = selected) {
         null -> "prayog — experiments"
-        is Entry.Run -> s.report.experiment
-        is Entry.Of  -> "sweep: ${s.sweep.stem}"
-        is Entry.Ag  -> "agree: ${s.agree.stem}"
+        is Entry.Run   -> s.report.experiment
+        is Entry.Of    -> "sweep: ${s.sweep.stem}"
+        is Entry.Ag    -> "agree: ${s.agree.stem}"
+        is Entry.Batch -> "batch: ${s.batch.stem}"
     }
 
     Scaffold(
@@ -57,10 +61,11 @@ fun PrayogApp() {
         Box(Modifier.padding(inner).fillMaxSize()) {
             when {
                 loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
-                selected is Entry.Run -> ReportDetail((selected as Entry.Run).report)
-                selected is Entry.Of  -> SweepDetail((selected as Entry.Of).sweep)
-                selected is Entry.Ag  -> AgreeDetail((selected as Entry.Ag).agree)
-                entries.isEmpty()     -> EmptyState()
+                selected is Entry.Run   -> ReportDetail((selected as Entry.Run).report)
+                selected is Entry.Of    -> SweepDetail((selected as Entry.Of).sweep)
+                selected is Entry.Ag    -> AgreeDetail((selected as Entry.Ag).agree)
+                selected is Entry.Batch -> BatchDetail((selected as Entry.Batch).batch)
+                entries.isEmpty()       -> EmptyState()
                 else -> EntryList(entries) { selected = it }
             }
         }
@@ -89,18 +94,20 @@ private fun EntryList(entries: List<Entry>, onPick: (Entry) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         items(entries, key = { keyFor(it) }) { e ->
             when (e) {
-                is Entry.Run -> RunCard(e.report) { onPick(e) }
-                is Entry.Of  -> SweepCard(e.sweep) { onPick(e) }
-                is Entry.Ag  -> AgreeCard(e.agree) { onPick(e) }
+                is Entry.Run   -> RunCard(e.report)  { onPick(e) }
+                is Entry.Of    -> SweepCard(e.sweep) { onPick(e) }
+                is Entry.Ag    -> AgreeCard(e.agree) { onPick(e) }
+                is Entry.Batch -> BatchCard(e.batch) { onPick(e) }
             }
         }
     }
 }
 
 private fun keyFor(e: Entry): String = when (e) {
-    is Entry.Run -> e.report.path
-    is Entry.Of  -> e.sweep.path
-    is Entry.Ag  -> e.agree.path
+    is Entry.Run   -> e.report.path
+    is Entry.Of    -> e.sweep.path
+    is Entry.Ag    -> e.agree.path
+    is Entry.Batch -> e.batch.path
 }
 
 @Composable
@@ -320,6 +327,139 @@ private fun QuantTail(label: String, generated: String, cut: Int, tint: androidx
         Text(tail.ifEmpty { "(agreed through end)" },
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun BatchCard(b: AgreeBatch, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        onClick = onClick,
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("batch: ${b.stem}  (${b.quantA} vs ${b.quantB})",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f))
+                Badge(containerColor = MaterialTheme.colorScheme.tertiary) {
+                    Text("${b.stats.count} prompts",
+                         style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Text(b.startedAt, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(6.dp))
+            FlowChips {
+                Chip("mean ${"%.0f".format(b.stats.meanByteRate * 100)}%")
+                Chip("median ${"%.0f".format(b.stats.medianByteRate * 100)}%")
+                Chip("perfect ${b.stats.perfectCount}/${b.stats.count}")
+                Chip("n=${b.n}")
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatchDetail(b: AgreeBatch) {
+    val scroll = androidx.compose.foundation.rememberScrollState()
+    Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(scroll)) {
+        Text("batch: ${b.stem}  (${b.quantA} vs ${b.quantB})",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold)
+        Text(b.startedAt, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(12.dp))
+
+        SectionHeader("config")
+        Metric("prompts file", b.promptsPath)
+        Metric("count",   b.stats.count.toString())
+        Metric("tokens",  b.n.toString())
+        Metric("seed",    b.seed.toString())
+        Metric("threads", b.threads.toString())
+
+        Spacer(Modifier.height(16.dp))
+        SectionHeader("distribution (byte rate)")
+        Metric("mean",    "%.1f%%".format(b.stats.meanByteRate * 100))
+        Metric("median",  "%.1f%%".format(b.stats.medianByteRate * 100))
+        Metric("p10",     "%.1f%%".format(b.stats.p10ByteRate * 100))
+        Metric("p90",     "%.1f%%".format(b.stats.p90ByteRate * 100))
+        Metric("min/max", "%.1f%% / %.1f%%".format(b.stats.minByteRate * 100, b.stats.maxByteRate * 100))
+        Metric("perfect", "${b.stats.perfectCount} / ${b.stats.count}")
+
+        Spacer(Modifier.height(16.dp))
+        SectionHeader("histogram")
+        AgreementHistogram(b.rows)
+
+        Spacer(Modifier.height(16.dp))
+        SectionHeader("per prompt")
+        b.rows.forEach { r -> BatchRowItem(r) }
+    }
+}
+
+@Composable
+private fun AgreementHistogram(rows: List<BatchRow>) {
+    // 10 buckets, 0-10%, 10-20%, ..., 90-100%. Simple bar chart with
+    // hand-drawn boxes; no third-party chart lib for walking skeleton.
+    val buckets = IntArray(10)
+    rows.forEach {
+        val idx = ((it.byteRate * 10).toInt()).coerceIn(0, 9)
+        buckets[idx]++
+    }
+    val max = (buckets.max().takeIf { it > 0 } ?: 1).toFloat()
+    Column(Modifier.fillMaxWidth()) {
+        buckets.forEachIndexed { i, count ->
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("${i*10}-${(i+1)*10}%",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.width(60.dp))
+                Box(
+                    Modifier
+                        .weight(count / max)
+                        .height(14.dp)
+                        .background(MaterialTheme.colorScheme.primary)
+                )
+                if (count > 0 && count / max < 0.95f) {
+                    Spacer(Modifier.weight(1f - count / max))
+                }
+                Text("  $count",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace)
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatchRowItem(r: BatchRow) {
+    val pct = (r.byteRate * 100).toInt()
+    val tint = when {
+        pct >= 90 -> MaterialTheme.colorScheme.primary
+        pct >= 50 -> MaterialTheme.colorScheme.secondary
+        else      -> MaterialTheme.colorScheme.error
+    }
+    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(r.prompt,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f))
+            Text("$pct%",
+                style = MaterialTheme.typography.labelMedium,
+                color = tint,
+                fontFamily = FontFamily.Monospace)
+        }
+        if (r.commonBytes < kotlin.math.max(r.lenA, r.lenB) && r.snippetA.isNotEmpty()) {
+            Text("  Δa: ${r.snippetA}",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
+            Text("  Δb: ${r.snippetB}",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
+        }
     }
 }
 

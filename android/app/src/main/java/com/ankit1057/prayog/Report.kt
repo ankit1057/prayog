@@ -107,6 +107,104 @@ data class Agree(
     }
 }
 
+data class BatchRow(
+    val prompt: String,
+    val commonBytes: Int,
+    val commonChars: Int,
+    val commonWords: Int,
+    val lenA: Int,
+    val lenB: Int,
+    val wordsA: Int,
+    val wordsB: Int,
+    val byteRate: Double,
+    val wordRate: Double,
+    val wallA: Double,
+    val wallB: Double,
+    val snippetA: String,
+    val snippetB: String,
+)
+
+data class BatchStats(
+    val count: Int,
+    val perfectCount: Int,
+    val meanByteRate: Double,
+    val meanWordRate: Double,
+    val medianByteRate: Double,
+    val p10ByteRate: Double,
+    val p90ByteRate: Double,
+    val minByteRate: Double,
+    val maxByteRate: Double,
+)
+
+data class AgreeBatch(
+    val path: String,
+    val startedAt: String,
+    val stem: String,
+    val quantA: String,
+    val quantB: String,
+    val promptsPath: String,
+    val n: Int,
+    val seed: Int,
+    val threads: Int,
+    val stats: BatchStats,
+    val rows: List<BatchRow>,
+) {
+    companion object {
+        fun parse(file: File): AgreeBatch? = try {
+            val root = JSONObject(file.readText())
+            if (!root.optString("schema").startsWith("prayog.agree-batch/")) return null
+            val stats = root.optJSONObject("stats") ?: return null
+            val rowsArr = root.optJSONArray("rows") ?: return null
+            val rows = buildList {
+                for (i in 0 until rowsArr.length()) {
+                    val r = rowsArr.getJSONObject(i)
+                    add(BatchRow(
+                        prompt      = r.optString("prompt"),
+                        commonBytes = r.optInt("common_bytes", 0),
+                        commonChars = r.optInt("common_chars", 0),
+                        commonWords = r.optInt("common_words", 0),
+                        lenA        = r.optInt("len_a", 0),
+                        lenB        = r.optInt("len_b", 0),
+                        wordsA      = r.optInt("words_a", 0),
+                        wordsB      = r.optInt("words_b", 0),
+                        byteRate    = r.optDouble("byte_rate", 0.0),
+                        wordRate    = r.optDouble("word_rate", 0.0),
+                        wallA       = r.optDouble("wall_a", 0.0),
+                        wallB       = r.optDouble("wall_b", 0.0),
+                        snippetA    = r.optString("snippet_a"),
+                        snippetB    = r.optString("snippet_b"),
+                    ))
+                }
+            }
+            AgreeBatch(
+                path = file.absolutePath,
+                startedAt = root.optString("started_at"),
+                stem   = root.optString("stem"),
+                quantA = root.optString("quant_a"),
+                quantB = root.optString("quant_b"),
+                promptsPath = root.optString("prompts_path"),
+                n = root.optInt("n", 0),
+                seed = root.optInt("seed", 0),
+                threads = root.optInt("threads", 0),
+                stats = BatchStats(
+                    count         = stats.optInt("count", 0),
+                    perfectCount  = stats.optInt("perfect_count", 0),
+                    meanByteRate  = stats.optDouble("mean_byte_rate", 0.0),
+                    meanWordRate  = stats.optDouble("mean_word_rate", 0.0),
+                    medianByteRate= stats.optDouble("median_byte_rate", 0.0),
+                    p10ByteRate   = stats.optDouble("p10_byte_rate", 0.0),
+                    p90ByteRate   = stats.optDouble("p90_byte_rate", 0.0),
+                    minByteRate   = stats.optDouble("min_byte_rate", 0.0),
+                    maxByteRate   = stats.optDouble("max_byte_rate", 0.0),
+                ),
+                rows = rows,
+            )
+        } catch (t: Throwable) {
+            null
+        }
+    }
+}
+
 data class Sweep(
     val path: String,
     val startedAt: String,
@@ -233,9 +331,10 @@ data class Report(
  */
 sealed interface Entry {
     val startedAt: String
-    data class Run(val report: Report) : Entry { override val startedAt get() = report.startedAt }
-    data class Of(val sweep: Sweep)    : Entry { override val startedAt get() = sweep.startedAt }
-    data class Ag(val agree: Agree)    : Entry { override val startedAt get() = agree.startedAt }
+    data class Run(val report: Report)   : Entry { override val startedAt get() = report.startedAt }
+    data class Of(val sweep: Sweep)      : Entry { override val startedAt get() = sweep.startedAt }
+    data class Ag(val agree: Agree)      : Entry { override val startedAt get() = agree.startedAt }
+    data class Batch(val batch: AgreeBatch) : Entry { override val startedAt get() = batch.startedAt }
 }
 
 /**
@@ -256,7 +355,8 @@ object ReportStore {
         return dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
             .orEmpty()
             .mapNotNull<File, Entry> { f ->
-                Agree.parse(f)?.let(Entry::Ag)
+                AgreeBatch.parse(f)?.let(Entry::Batch)
+                    ?: Agree.parse(f)?.let(Entry::Ag)
                     ?: Sweep.parse(f)?.let(Entry::Of)
                     ?: Report.parse(f)?.let(Entry::Run)
             }
