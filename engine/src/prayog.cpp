@@ -35,8 +35,9 @@
 
 namespace prayog {
 
-constexpr const char* kVersion = "0.2.0";
-constexpr const char* kSchema  = "prayog.run/2";
+constexpr const char* kVersion     = "0.3.0";
+constexpr const char* kSchema      = "prayog.run/2";
+constexpr const char* kSweepSchema = "prayog.sweep/1";
 
 static std::string trim(std::string_view s);
 
@@ -582,6 +583,193 @@ static int cmd_pull(int argc, char** argv) {
     return 0;
 }
 
+// --- sweep: run one prompt across a matrix of quants ----------------------
+// Decomposes `stem:quant` back into a URL via the registry, resolves the GGUF
+// filename, errors cleanly if a model isn't pulled. Each quant is one child
+// llm-engine invocation; its metrics become one row of the sweep matrix.
+
+struct SweepRun {
+    std::string quant;
+    std::string model_path;
+    double model_size_mb = 0.0;
+    BenchResult bench;
+    std::string run_report_path;
+};
+
+static std::vector<std::string> split_csv(std::string_view s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == ',') { if (!cur.empty()) out.push_back(trim(cur)); cur.clear(); }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) out.push_back(trim(cur));
+    return out;
+}
+
+static std::string resolve_model_file(const std::string& stem, const std::string& quant) {
+    std::string full_name = stem + ":" + quant;
+    std::string url = user_registry_url(full_name);
+    if (url.empty()) url = builtin_model_url(full_name);
+    if (url.empty()) return "";
+    // Look under $PRAYOG_HOME/models AND $HOME/.sipllm/models (sipllm may have
+    // pulled the same file; we accept either so you don't have to double-pull).
+    std::string base = basename_of(url);
+    std::vector<std::string> candidates = {
+        models_dir() + "/" + base,
+        std::string(std::getenv("HOME") ? std::getenv("HOME") : ".") + "/.sipllm/models/" + base,
+    };
+    for (auto& c : candidates) {
+        struct stat st{};
+        if (::stat(c.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return c;
+    }
+    return "";
+}
+
+static int cmd_sweep(int argc, char** argv) {
+    // prayog sweep [--stem NAME] --quants Q1,Q2,... [--prompt "..."] [-n N]
+    //              [--threads T] [--engine PATH]
+    std::string stem    = "tinyllama";
+    std::string quants_csv;
+    std::string prompt  = "The capital of France is";
+    int         n       = 16;
+    int         threads = 4;
+    std::string engine  = (std::getenv("HOME") ? std::string(std::getenv("HOME")) : ".")
+                          + "/.sipllm/bin/llm-engine";
+
+    for (int i = 2; i < argc; ++i) {
+        std::string_view f = argv[i];
+        if      (f == "--stem"    && i + 1 < argc) stem    = argv[++i];
+        else if (f == "--quants"  && i + 1 < argc) quants_csv = argv[++i];
+        else if (f == "--prompt"  && i + 1 < argc) prompt  = argv[++i];
+        else if (f == "-n"        && i + 1 < argc) n       = std::atoi(argv[++i]);
+        else if (f == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+        else if (f == "--engine"  && i + 1 < argc) engine  = argv[++i];
+        else { std::fprintf(stderr, "prayog sweep: unknown flag %s\n", argv[i]); return 2; }
+    }
+    if (quants_csv.empty()) {
+        std::fprintf(stderr,
+            "usage: prayog sweep [--stem NAME] --quants Q1,Q2,... [--prompt \"...\"] [-n N]\n"
+            "       e.g. prayog sweep --stem tinyllama --quants q4_k_m,q8_0 -n 16\n");
+        return 2;
+    }
+    auto quants = split_csv(quants_csv);
+    if (quants.empty()) { std::fprintf(stderr, "prayog sweep: no quants parsed\n"); return 2; }
+
+    // Preflight: all models must be present.
+    std::vector<std::pair<std::string, std::string>> resolved; // (quant, path)
+    for (auto& q : quants) {
+        std::string path = resolve_model_file(stem, q);
+        if (path.empty()) {
+            std::fprintf(stderr,
+                "prayog sweep: %s:%s not found in %s or ~/.sipllm/models.\n"
+                "  run: prayog pull %s:%s\n",
+                stem.c_str(), q.c_str(), models_dir().c_str(),
+                stem.c_str(), q.c_str());
+            return 1;
+        }
+        resolved.emplace_back(q, path);
+    }
+
+    std::fprintf(stderr, "prayog sweep: stem=%s quants=[%s] n=%d threads=%d prompt=%.40s%s\n",
+                 stem.c_str(), quants_csv.c_str(), n, threads,
+                 prompt.c_str(), prompt.size() > 40 ? "..." : "");
+
+    std::vector<SweepRun> runs;
+    runs.reserve(resolved.size());
+    for (auto& [q, path] : resolved) {
+        std::fprintf(stderr, "\n[%zu/%zu] %s:%s\n", runs.size() + 1, resolved.size(),
+                     stem.c_str(), q.c_str());
+
+        SweepRun r;
+        r.quant = q;
+        r.model_path = path;
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0) r.model_size_mb = st.st_size / 1048576.0;
+
+        std::vector<std::string> cmd = {
+            engine, path,
+            "-p", prompt,
+            "-n", std::to_string(n),
+            "--greedy",
+            "--threads", std::to_string(threads),
+        };
+        r.bench = run_and_measure(cmd);
+        r.bench.inference = parse_inference_metrics(r.bench.stderr_full, r.bench.stdout_full);
+
+        std::string tag = "sweep-" + stem + "-" + q;
+        std::string json = serialize(r.bench, tag);
+        r.run_report_path = next_report_path(tag);
+        std::ofstream f(r.run_report_path);
+        f << json;
+
+        std::fprintf(stderr, "      wall=%.3fs maxrss=%.1fMB exit=%d\n",
+                     r.bench.wall_sec, r.bench.maxrss_kb / 1024.0, r.bench.exit_code);
+        print_inference_summary(r.bench.inference);
+        runs.push_back(std::move(r));
+    }
+
+    // Emit sweep summary JSON.
+    auto t = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char ts[64];
+    std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
+    std::string summary_path = reports_dir() + "/" + ts + "-sweep-" + stem + ".json";
+    {
+        std::ofstream f(summary_path);
+        f << "{\n";
+        f << "  \"schema\": \"" << kSweepSchema << "\",\n";
+        f << "  \"started_at\": \"" << iso8601_now() << "\",\n";
+        f << "  \"stem\": \""    << json_escape(stem)   << "\",\n";
+        f << "  \"prompt\": \""  << json_escape(prompt) << "\",\n";
+        f << "  \"n\": "         << n       << ",\n";
+        f << "  \"threads\": "   << threads << ",\n";
+        f << "  \"engine\": \""  << json_escape(engine) << "\",\n";
+        f << "  \"runs\": [\n";
+        for (size_t i = 0; i < runs.size(); ++i) {
+            const auto& r = runs[i];
+            const auto& m = r.bench.inference;
+            f << "    {\n";
+            f << "      \"quant\": \"" << json_escape(r.quant) << "\",\n";
+            f << "      \"model\": \"" << json_escape(r.model_path) << "\",\n";
+            f << "      \"model_size_mb\": " << r.model_size_mb << ",\n";
+            f << "      \"run_report\": \"" << json_escape(r.run_report_path) << "\",\n";
+            f << "      \"exit_code\": " << r.bench.exit_code << ",\n";
+            f << "      \"wall_sec\": "  << r.bench.wall_sec  << ",\n";
+            f << "      \"maxrss_mb\": " << (r.bench.maxrss_kb / 1024.0) << ",\n";
+            f << "      \"inference\": {\n";
+            f << "        \"decode_tok_s\":  " << m.decode_tok_s  << ",\n";
+            f << "        \"prefill_tok_s\": " << m.prefill_tok_s << ",\n";
+            f << "        \"ttft_s\": "        << m.ttft_s        << ",\n";
+            f << "        \"generated\": "     << m.generated     << ",\n";
+            f << "        \"weights_resident_mb\": " << m.weights_resident_mb << ",\n";
+            f << "        \"streamed_mb\": "   << m.streamed_mb   << "\n";
+            f << "      }\n";
+            f << "    }" << (i + 1 < runs.size() ? "," : "") << "\n";
+        }
+        f << "  ]\n";
+        f << "}\n";
+    }
+
+    // Print matrix markdown to stdout for immediate consumption.
+    std::printf("\n# sweep: %s (n=%d, threads=%d)\n\n", stem.c_str(), n, threads);
+    std::printf("prompt: `%s`\n\n", prompt.c_str());
+    std::printf("| quant      | size MB | decode tok/s | prefill tok/s | TTFT ms | peak RSS MB | wall s |\n");
+    std::printf("|------------|---------|--------------|---------------|---------|-------------|--------|\n");
+    for (auto& r : runs) {
+        const auto& m = r.bench.inference;
+        std::printf("| %-10s | %7.1f | %12.2f | %13.2f | %7.0f | %11.1f | %6.2f |\n",
+                    r.quant.c_str(),
+                    r.model_size_mb,
+                    m.decode_tok_s, m.prefill_tok_s, m.ttft_s * 1000,
+                    r.bench.maxrss_kb / 1024.0,
+                    r.bench.wall_sec);
+    }
+    std::fprintf(stderr, "\nprayog: wrote %s\n", summary_path.c_str());
+    return 0;
+}
+
 static int cmd_models(int /*argc*/, char** /*argv*/) {
     std::string dir = models_dir();
     DIR* d = opendir(dir.c_str());
@@ -661,6 +849,7 @@ static int usage() {
         "usage:\n"
         "  prayog bench [--experiment NAME] [--inference] <cmd> [args...]\n"
         "  prayog run     <experiment.toml>\n"
+        "  prayog sweep   [--stem NAME] --quants Q1,Q2,... [--prompt \"...\"] [-n N]\n"
         "  prayog pull    <name|url> [--as filename]\n"
         "  prayog models\n"
         "  prayog compare <a.json> <b.json>\n"
@@ -679,6 +868,7 @@ int main(int argc, char** argv) {
     std::string_view sub = argv[1];
     if (sub == "bench")   return prayog::cmd_bench(argc, argv);
     if (sub == "run")     return prayog::cmd_run(argc, argv);
+    if (sub == "sweep")   return prayog::cmd_sweep(argc, argv);
     if (sub == "pull")    return prayog::cmd_pull(argc, argv);
     if (sub == "models")  return prayog::cmd_models(argc, argv);
     if (sub == "compare") return prayog::cmd_compare(argc, argv);

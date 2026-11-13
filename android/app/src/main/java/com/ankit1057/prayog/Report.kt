@@ -4,8 +4,12 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Mirror of the JSON schema `prayog.run/2` emitted by engine/src/prayog.cpp.
- * Backwards-compatible with `prayog.run/1`: missing inference block → null.
+ * Mirrors of the JSON schemas emitted by engine/src/prayog.cpp:
+ *   - prayog.run/1, prayog.run/2  → [Report]
+ *   - prayog.sweep/1              → [Sweep]
+ *
+ * Schema bumps are backwards-additive — v1 readers must still parse v2 output
+ * (unknown fields are dropped). Keep this in sync with prayog.cpp:kSchema.
  */
 data class Inference(
     val decodeTokS: Double,
@@ -19,6 +23,75 @@ data class Inference(
     val contextUsed: Int,
     val contextMax: Int,
 )
+
+data class SweepRow(
+    val quant: String,
+    val modelPath: String,
+    val modelSizeMb: Double,
+    val runReportPath: String,
+    val exitCode: Int,
+    val wallSec: Double,
+    val maxRssMb: Double,
+    val inference: Inference,
+)
+
+data class Sweep(
+    val path: String,
+    val startedAt: String,
+    val stem: String,
+    val prompt: String,
+    val n: Int,
+    val threads: Int,
+    val engine: String,
+    val runs: List<SweepRow>,
+) {
+    companion object {
+        fun parse(file: File): Sweep? = try {
+            val root = JSONObject(file.readText())
+            if (!root.optString("schema").startsWith("prayog.sweep/")) return null
+            val runsArr = root.optJSONArray("runs") ?: return null
+            val rows = buildList {
+                for (i in 0 until runsArr.length()) {
+                    val r = runsArr.getJSONObject(i)
+                    val inf = r.optJSONObject("inference") ?: JSONObject()
+                    add(SweepRow(
+                        quant         = r.optString("quant"),
+                        modelPath     = r.optString("model"),
+                        modelSizeMb   = r.optDouble("model_size_mb", 0.0),
+                        runReportPath = r.optString("run_report"),
+                        exitCode      = r.optInt("exit_code", -1),
+                        wallSec       = r.optDouble("wall_sec", 0.0),
+                        maxRssMb      = r.optDouble("maxrss_mb", 0.0),
+                        inference = Inference(
+                            decodeTokS       = inf.optDouble("decode_tok_s", 0.0),
+                            prefillTokS      = inf.optDouble("prefill_tok_s", 0.0),
+                            ttftS            = inf.optDouble("ttft_s", 0.0),
+                            promptTokens     = 0,
+                            generated        = inf.optInt("generated", 0),
+                            weightsResidentMb= inf.optDouble("weights_resident_mb", 0.0),
+                            kvCacheMb        = 0.0,
+                            streamedMb       = inf.optDouble("streamed_mb", 0.0),
+                            contextUsed      = 0,
+                            contextMax       = 0,
+                        ),
+                    ))
+                }
+            }
+            Sweep(
+                path = file.absolutePath,
+                startedAt = root.optString("started_at"),
+                stem = root.optString("stem"),
+                prompt = root.optString("prompt"),
+                n = root.optInt("n", 0),
+                threads = root.optInt("threads", 0),
+                engine = root.optString("engine"),
+                runs = rows,
+            )
+        } catch (t: Throwable) {
+            null
+        }
+    }
+}
 
 data class Report(
     val path: String,
@@ -81,6 +154,18 @@ data class Report(
 }
 
 /**
+ * A list-row entry. Sweep summaries are rendered as one card with a matrix;
+ * individual runs are rendered as standalone rows. Per-quant child reports
+ * written by sweep are kept in the list too (filename contains "sweep-") so
+ * you can drill into any single row.
+ */
+sealed interface Entry {
+    val startedAt: String
+    data class Run(val report: Report) : Entry { override val startedAt get() = report.startedAt }
+    data class Of(val sweep: Sweep)    : Entry { override val startedAt get() = sweep.startedAt }
+}
+
+/**
  * Where we look for reports on-device. The engine writes to $PRAYOG_HOME/reports;
  * from the Android app's POV that lives on shared storage so both sides can see it.
  */
@@ -93,11 +178,14 @@ object ReportStore {
      */
     const val DEFAULT_PATH = "/storage/emulated/0/prayog/reports"
 
-    fun loadAll(dir: File = File(DEFAULT_PATH)): List<Report> {
+    fun loadAll(dir: File = File(DEFAULT_PATH)): List<Entry> {
         if (!dir.isDirectory) return emptyList()
         return dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
             .orEmpty()
-            .mapNotNull(Report::parse)
+            .mapNotNull<File, Entry> { f ->
+                Sweep.parse(f)?.let(Entry::Of)
+                    ?: Report.parse(f)?.let(Entry::Run)
+            }
             .sortedByDescending { it.startedAt }
     }
 }

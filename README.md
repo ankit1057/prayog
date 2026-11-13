@@ -67,6 +67,7 @@ at a sideloaded SDK) but slow — the walking skeleton assumes a workstation bui
 |----------------------------|--------------|
 | `prayog bench [--inference] CMD [ARGS]`  | time one command, write report; `--inference` scrapes llm-engine metrics |
 | `prayog run EXP.toml`      | run a declared experiment (auto-scrapes if cmd is llm-engine) |
+| `prayog sweep --stem NAME --quants Q1,Q2,... [--prompt "..."] [-n N] [--threads T]` | run one prompt across a quant matrix |
 | `prayog pull NAME\|URL [--as FILE]` | download a GGUF to `$PRAYOG_HOME/models/` |
 | `prayog models`            | list downloaded models with sizes |
 | `prayog compare A.json B.json` | side-by-side metric diff |
@@ -80,17 +81,25 @@ Add your own at `$PRAYOG_HOME/models.conf` (one line per model: `name<TAB>url`).
 
 ### reference inference numbers (this device, 2026-11-13)
 
-TinyLlama 1.1B Q8_0, greedy, 16 tokens, 4 threads, Termux aarch64:
+TinyLlama 1.1B, greedy, 16 tokens, 4 threads, prompt `"The capital of France is"`,
+Termux aarch64:
 
-| metric   | value |
-|----------|-------|
-| decode   | 4.19 tok/s |
-| prefill  | 12.72 tok/s |
-| ttft     | 629 ms |
-| weights resident | 1099 MB |
-| streamed from disk | 1030 MB |
-| peak rss | 1154 MB |
-| wall     | 5.47 s |
+| quant  | size MB | decode tok/s | prefill tok/s | TTFT ms | peak RSS MB | wall s |
+|--------|---------|--------------|---------------|---------|-------------|--------|
+| q4_k_m |   637.8 |         4.58 |          8.42 |     712 |       706.4 |   4.92 |
+| q8_0   |  1116.5 |         4.24 |         10.24 |     586 |      1154.1 |   8.05 |
+
+Q4_K_M wins decode throughput on this CPU (less dequant work per token
+amortised against fewer bytes to touch); Q8_0 wins prefill and TTFT.
+
+Reproduce:
+
+```bash
+prayog pull tinyllama:q4_k_m
+prayog pull tinyllama:q8_0
+prayog sweep --stem tinyllama --quants q4_k_m,q8_0 \
+             --prompt "The capital of France is" -n 16 --threads 4
+```
 
 ## experiment file format
 

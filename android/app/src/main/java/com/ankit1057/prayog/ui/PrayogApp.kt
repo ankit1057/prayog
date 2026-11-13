@@ -12,28 +12,37 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.ankit1057.prayog.Entry
 import com.ankit1057.prayog.Inference
 import com.ankit1057.prayog.Report
 import com.ankit1057.prayog.ReportStore
+import com.ankit1057.prayog.Sweep
+import com.ankit1057.prayog.SweepRow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PrayogApp() {
-    var reports by remember { mutableStateOf(emptyList<Report>()) }
-    var selected by remember { mutableStateOf<Report?>(null) }
+    var entries by remember { mutableStateOf(emptyList<Entry>()) }
+    var selected by remember { mutableStateOf<Entry?>(null) }
     var loading by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
-        reports = withContext(Dispatchers.IO) { ReportStore.loadAll() }
+        entries = withContext(Dispatchers.IO) { ReportStore.loadAll() }
         loading = false
+    }
+
+    val title = when (val s = selected) {
+        null -> "prayog — experiments"
+        is Entry.Run -> s.report.experiment
+        is Entry.Of  -> "sweep: ${s.sweep.stem}"
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (selected == null) "prayog — experiments" else selected!!.experiment) },
+                title = { Text(title) },
                 navigationIcon = {
                     if (selected != null) {
                         TextButton(onClick = { selected = null }) { Text("Back") }
@@ -45,9 +54,10 @@ fun PrayogApp() {
         Box(Modifier.padding(inner).fillMaxSize()) {
             when {
                 loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
-                selected != null -> ReportDetail(selected!!)
-                reports.isEmpty() -> EmptyState()
-                else -> ReportList(reports) { selected = it }
+                selected is Entry.Run -> ReportDetail((selected as Entry.Run).report)
+                selected is Entry.Of  -> SweepDetail((selected as Entry.Of).sweep)
+                entries.isEmpty()     -> EmptyState()
+                else -> EntryList(entries) { selected = it }
             }
         }
     }
@@ -71,32 +81,74 @@ private fun EmptyState() {
 }
 
 @Composable
-private fun ReportList(reports: List<Report>, onPick: (Report) -> Unit) {
+private fun EntryList(entries: List<Entry>, onPick: (Entry) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        items(reports, key = { it.path }) { r ->
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                onClick = { onPick(r) }
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(r.experiment, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                        if (r.isInference) Badge(containerColor = MaterialTheme.colorScheme.primary) {
-                            Text("inference", style = MaterialTheme.typography.labelSmall)
-                        }
-                    }
-                    Text(r.startedAt, style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.height(6.dp))
-                    FlowChips {
-                        if (r.isInference && r.inference != null) {
-                            Chip("${"%.2f".format(r.inference.decodeTokS)} tok/s")
-                            Chip("ttft ${"%.0f".format(r.inference.ttftS * 1000)}ms")
-                            Chip("gen ${r.inference.generated}")
-                        }
-                        Chip("wall ${"%.2f".format(r.wallSec)}s")
-                        Chip("rss ${"%.0f".format(r.maxRssMb)}MB")
-                        Chip("exit ${r.exitCode}", ok = r.exitCode == 0)
-                    }
+        items(entries, key = { keyFor(it) }) { e ->
+            when (e) {
+                is Entry.Run -> RunCard(e.report) { onPick(e) }
+                is Entry.Of  -> SweepCard(e.sweep) { onPick(e) }
+            }
+        }
+    }
+}
+
+private fun keyFor(e: Entry): String = when (e) {
+    is Entry.Run -> e.report.path
+    is Entry.Of  -> e.sweep.path
+}
+
+@Composable
+private fun RunCard(r: Report, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        onClick = onClick,
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(r.experiment, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                if (r.isInference) Badge(containerColor = MaterialTheme.colorScheme.primary) {
+                    Text("inference", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Text(r.startedAt, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(6.dp))
+            FlowChips {
+                if (r.isInference && r.inference != null) {
+                    Chip("${"%.2f".format(r.inference.decodeTokS)} tok/s")
+                    Chip("ttft ${"%.0f".format(r.inference.ttftS * 1000)}ms")
+                    Chip("gen ${r.inference.generated}")
+                }
+                Chip("wall ${"%.2f".format(r.wallSec)}s")
+                Chip("rss ${"%.0f".format(r.maxRssMb)}MB")
+                Chip("exit ${r.exitCode}", ok = r.exitCode == 0)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SweepCard(s: Sweep, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        onClick = onClick,
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("sweep: ${s.stem}",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f))
+                Badge(containerColor = MaterialTheme.colorScheme.secondary) {
+                    Text("${s.runs.size} quants", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Text(s.startedAt, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(6.dp))
+            FlowChips {
+                Chip("n=${s.n}")
+                Chip("threads=${s.threads}")
+                val fastest = s.runs.maxByOrNull { it.inference.decodeTokS }
+                if (fastest != null) {
+                    Chip("${fastest.quant}: ${"%.2f".format(fastest.inference.decodeTokS)} tok/s")
                 }
             }
         }
@@ -162,6 +214,66 @@ private fun ReportDetail(r: Report) {
                 Text(r.stdoutSample.take(2048),
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SweepDetail(s: Sweep) {
+    val scroll = androidx.compose.foundation.rememberScrollState()
+    Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(scroll)) {
+        Text("sweep: ${s.stem}", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(s.startedAt, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(12.dp))
+        SectionHeader("config")
+        Metric("prompt",  "\"${s.prompt}\"")
+        Metric("tokens",  s.n.toString())
+        Metric("threads", s.threads.toString())
+        Spacer(Modifier.height(16.dp))
+        SectionHeader("matrix")
+        SweepMatrix(s.runs)
+        Spacer(Modifier.height(16.dp))
+        SectionHeader("verdict")
+        val bestDecode = s.runs.maxByOrNull { it.inference.decodeTokS }
+        val lightest   = s.runs.minByOrNull { it.maxRssMb }
+        val fastestTtft= s.runs.minByOrNull { it.inference.ttftS }
+        if (bestDecode != null)  Metric("best decode",  "${bestDecode.quant}  (${"%.2f".format(bestDecode.inference.decodeTokS)} tok/s)")
+        if (lightest != null)    Metric("lightest",     "${lightest.quant}  (${"%.0f".format(lightest.maxRssMb)} MB peak RSS)")
+        if (fastestTtft != null) Metric("fastest TTFT", "${fastestTtft.quant}  (${"%.0f".format(fastestTtft.inference.ttftS * 1000)} ms)")
+    }
+}
+
+@Composable
+private fun SweepMatrix(rows: List<SweepRow>) {
+    // Hand-rolled table — 6 columns (quant, size, decode, prefill, TTFT, RSS).
+    // Not using a real DataTable component to stay in Compose Material3 stock.
+    val headers = listOf("quant", "size MB", "decode t/s", "prefill t/s", "TTFT ms", "RSS MB")
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+            headers.forEach { h ->
+                Text(h,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.weight(1f))
+            }
+        }
+        HorizontalDivider()
+        rows.forEach { r ->
+            Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                listOf(
+                    r.quant,
+                    "%.0f".format(r.modelSizeMb),
+                    "%.2f".format(r.inference.decodeTokS),
+                    "%.2f".format(r.inference.prefillTokS),
+                    "%.0f".format(r.inference.ttftS * 1000),
+                    "%.0f".format(r.maxRssMb),
+                ).forEach { v ->
+                    Text(v,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.weight(1f))
+                }
             }
         }
     }

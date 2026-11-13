@@ -62,15 +62,15 @@ Clang 21.1.8 for aarch64 Android target. `-O2 -march=armv8-a`. Binary at
   "Run from phone" is a separate future spike (ProcessBuilder + jniLibs
   extraction) — not v1.
 
-## known gaps (as of 0.2.0)
+## known gaps (as of 0.3.0)
 
 - No perplexity eval harness yet. `prayog eval <model> <wikitext.txt>`
   is the natural next subcommand — needs a tokenizer round-trip and a logit
   dump path on `llm-engine`.
-- No quant-sweep runner. Would live as `prayog sweep <model-stem>`,
-  pulling each quant variant and calling `run` over a matrix.
-- Android app: no run-triggering, no history graphing, no diff view. All
-  reasonable adds now that the JSON schema has stabilised at v2.
+- Sweep preflight fails hard when a model is missing; `prayog sweep --pull`
+  (auto-fetch missing quants) is a sensible add.
+- Android app: no run-triggering (termux-exec intents), no history graphing
+  across runs of the same experiment, no cross-sweep diff.
 - Download resumability relies on curl's `-C -`. If a partial file is
   corrupt, delete it and retry.
 

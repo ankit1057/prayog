@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.3.0 — 2026-11-13
+
+**Quant sweeps.**
+
+### engine
+- New `prayog sweep --stem NAME --quants Q1,Q2,... [--prompt "..."] [-n N]
+  [--threads T] [--engine PATH]` subcommand. Runs one prompt across a matrix
+  of quantizations, writes per-quant run reports *and* a sweep summary
+  (schema `prayog.sweep/1`). Preflight checks look for models in both
+  `$PRAYOG_HOME/models` and `~/.sipllm/models`, so pulls done via sipllm
+  are reusable.
+- Sweep prints a 6-column markdown matrix to stdout: quant, size MB,
+  decode tok/s, prefill tok/s, TTFT ms, peak RSS MB, wall s.
+
+### reference measurement (Termux aarch64, this device, 2026-11-13)
+TinyLlama 1.1B greedy, 16 tokens, 4 threads, prompt "The capital of France is":
+
+| quant  | size MB | decode tok/s | prefill tok/s | TTFT ms | peak RSS MB | wall s |
+|--------|---------|--------------|---------------|---------|-------------|--------|
+| q4_k_m |   637.8 |         4.58 |          8.42 |     712 |       706.4 |   4.92 |
+| q8_0   |  1116.5 |         4.24 |         10.24 |     586 |      1154.1 |   8.05 |
+
+Note: Q4_K_M wins decode throughput (4.58 vs 4.24 tok/s) despite lower
+precision — fewer bytes to touch per token offsets the extra dequant work on
+this CPU. Q8_0 wins TTFT (586 ms vs 712 ms) and prefill tok/s. Half the
+memory footprint for Q4.
+
+### android
+- `Sweep`, `SweepRow`, `Entry` added. `ReportStore.loadAll` returns
+  `List<Entry>` sorted newest-first; sweeps and runs intermix.
+- Sweep cards in the list show `n`, `threads`, and the fastest quant's
+  decode tok/s.
+- Sweep detail screen: config section, 6-column matrix, verdict section
+  (best decode / lightest / fastest TTFT).
+- Run cards unchanged; schema `prayog.run/1` still parses.
+
 ## 0.2.0 — 2026-11-13
 
 **Real inference metrics.**
